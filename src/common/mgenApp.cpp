@@ -57,7 +57,8 @@ void MgenApp::Usage()
             "     [convert <binaryLog>][debug <debugLevel>]\n"
             "     [gpskey <gpsSharedMemoryLocation>]\n"
             "     [boost] [reuse {on|off}]\n"
-            "     [epochtimestamp]\n");
+            "     [epochtimestamp]\n"
+            "     [windowQuantize {on|off}]\n");
 }  // end MgenApp::Usage()
 
 
@@ -83,6 +84,7 @@ const char* const MgenApp::CMD_LIST[] =
     "+logdata",    // log optional data attribute? default ON
     "+loggpsdata", // log gps data? default ON
     "-epochtimestamp", // epoch timesetamps? default OFF
+    "+windowQuantize", // quantize analytics window? default ON
 //   "-analytics",  // enables MGEN analytics reporting on received flows
     NULL
 };
@@ -471,6 +473,24 @@ bool MgenApp::OnCommand(const char* cmd, const char* val)
     else if (!strncmp("epochtimestamp", lowerCmd, len))
     {
         mgen.SetEpochTimestamp(true);
+    }
+    else if (!strncmp("windowQuantize", lowerCmd, len))
+    {
+      char status[4];  // valid status is "on" or "off"
+      strncpy(status, val, 3);
+      status[3] = '\0';
+      unsigned int len = strlen(status);
+      for (unsigned int i = 0; i < len; i++)
+    status[i] = tolower(status[i]);
+      if (!strncmp("on", status, len))
+    mgen.SetWindowQuantize(true);
+      else if (!strncmp("off",status,len))
+    mgen.SetWindowQuantize(false);
+      else
+      {
+    DMSG(0, "MgenApp::ProcessCommand(windowQuantize) Error: wrong argument to windowQuantize:%s\n",status);
+    return false;
+      }
     }
     else if (!strncmp("help", lowerCmd, len))
     {
@@ -921,5 +941,4 @@ bool MgenApp::ReadCmdInput(char* buffer, unsigned int& numBytes)
 
 // This macro instantiates our MgenApp instance
 PROTO_INSTANTIATE_APP(MgenApp)
-
 

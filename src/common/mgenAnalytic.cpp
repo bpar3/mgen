@@ -29,6 +29,7 @@ bool MgenAnalytic::Init(Protocol               protocol,
                         const ProtoAddress&    srcAddr,
                         const ProtoAddress&    dstAddr,
                         UINT32                 flowId, 
+                        bool                   windowQuantize,
                         double                 windowSize,
                         UINT32                 historyDepth)
 {
@@ -46,8 +47,18 @@ bool MgenAnalytic::Init(Protocol               protocol,
         dup_mask.Destroy();
         return false;
     }
-    UINT8 q = Report::QuantizeTimeValue(windowSize);
-    window_size = MgenAnalytic::Report::UnquantizeTimeValue(q);
+    if (windowQuantize)
+    {
+        UINT8 q = Report::QuantizeTimeValue(windowSize);
+        window_size = MgenAnalytic::Report::UnquantizeTimeValue(q);
+    }
+    else
+    {
+        if (windowSize > 0)
+        {
+            window_size = windowSize;
+        }
+    }
     memcpy(flow_key, dstAddr.GetRawHostAddress(), dstLen);
     unsigned int keyLen = dstLen;
     UINT16 port = dstAddr.GetPort();

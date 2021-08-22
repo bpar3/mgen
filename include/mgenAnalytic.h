@@ -78,6 +78,7 @@ class MgenAnalytic : public ProtoQueue::Item
                   const ProtoAddress&    srcAddr, 
                   const ProtoAddress&    dstAddr, 
                   UINT32                 flowId, 
+                  bool                   windowQuantize,
                   double                 windowSize = MgenAnalytic::DEFAULT_WINDOW,
                   UINT32                 historyDepth = MgenAnalytic::DEFAULT_HISTORY);
         

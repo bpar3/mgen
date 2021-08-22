@@ -113,7 +113,7 @@ Mgen::Mgen(ProtoTimerMgr&         timerMgr,
   checksum_enable(false), 
   addr_type(ProtoAddress::IPv4), 
   analytic_window(MgenAnalytic::DEFAULT_WINDOW),
-  compute_analytics(false), report_analytics(false),
+  compute_analytics(false), report_analytics(false),window_quantize(true),
   get_position(NULL), get_position_data(NULL),
   log_file(NULL), log_binary(false), local_time(false), log_flush(false), 
   log_file_lock(false), log_tx(false), log_rx(true), log_open(false), log_empty(true),
@@ -1040,7 +1040,7 @@ void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protoc
             PLOG(PL_ERROR, "Mgen::UpdateRecvAnalytics() new MgenAnalytic() error: %s\n", GetErrorString());
             return;
         }
-        if (!analytic->Init(theProtocol, theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId(), analytic_window))
+        if (!analytic->Init(theProtocol, theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId(), window_quantize, analytic_window))
         {
             PLOG(PL_ERROR, "Mgen::UpdateRecvAnalytics() MgenAnalytic() initialization error: %s\n", GetErrorString());
             return;
@@ -1452,6 +1452,7 @@ const StringMapper Mgen::COMMAND_LIST[] =
     {"+PAUSE",      PAUSE},
     {"+RECONNECT",  RECONNECT},
     {"-EPOCHTIMESTAMP", EPOCH_TIMESTAMP},
+    {"+WINDOWQUANTIZE", WINDOW_QUANTIZE},
     {"+OFF",        INVALID_COMMAND},  // to deconflict "offset" from "off" event
     {NULL,          INVALID_COMMAND}   
 };
@@ -2132,6 +2133,36 @@ bool Mgen::OnCommand(Mgen::Command cmd, const char* arg, bool override)
     case EPOCH_TIMESTAMP:
       SetEpochTimestamp(true);
       break;
+    case WINDOW_QUANTIZE:
+    {
+      if (!arg)
+      {
+          DMSG(0, "Mgen::OnCommand() Error: missing argument to windowQuantize\n");
+          return false;
+      }
+      bool windowQuantizeTmp;
+      // convert to upper case for case-insensitivity
+      char temp[4];
+      size_t len = strlen(arg);
+      len = len < 4 ? len : 4;
+      unsigned int i;
+      for (i = 0 ; i < len; i++)
+        temp[i] = toupper(arg[i]);
+      temp[i] = '\0';
+      if(!strncmp("ON", temp, len))
+          windowQuantizeTmp = true;
+      else if(!strncmp("OFF", temp, len))
+          windowQuantizeTmp = false;
+      else
+      {
+          DMSG(0, "Mgen::OnCommand() Error: wrong argument to RXLOG: %s\n", arg);
+          return false;   
+      }
+      SetWindowQuantize (windowQuantizeTmp);
+      break;
+    }
+
+
     case INVALID_COMMAND:
       DMSG(0, "Mgen::OnCommand() Error: invalid command\n");
       return false;   

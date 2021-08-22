@@ -170,6 +170,7 @@ class Mgen
       PAUSE,     // Pauses flow while tcp attempts to reconnect
       RECONNECT, // Enables TCP reconnect
       EPOCH_TIMESTAMP, // Log timetamp as epoch time in sec.usec format
+      WINDOW_QUANTIZE, // analytics window size quantize 
       RESET
     };
 
@@ -282,6 +283,10 @@ class Mgen
     void SetLogGpsData(bool logGpsData)
     {
       log_gps_data = logGpsData;
+    }
+    void SetWindowQuantize(bool enable)
+    {
+      window_quantize = enable;
     }
     void ClearHostAddress()
     {
@@ -544,6 +549,7 @@ class Mgen
     double             analytic_window;
     bool               compute_analytics; // measure and log analytics for recv flows
     bool               report_analytics;  // include analytic reports in message payload for all flows
+    bool               window_quantize;  // quantize analytics window size
     MgenEvent::FlowStatus flow_status;    // keeps state for received MgenFlowCommands
     
     MgenPositionFunc*  get_position;
