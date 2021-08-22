@@ -96,85 +96,24 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
             msg_count = byte_count = 0;
             latency_sum = latency_min = latency_max = 0.0;
         }
-        window_valid = true;
         return false;  
     }
-    double latency = 0.0;
-    if (0 != msgSize)
-    {
-        if (dup_mask.IsSet())
-        {
-        
-            // IMPORTANT TBD: manage the duplicate detector more intelligently (or limit its range, perhaps temporally)
-            if (dup_mask.Test(seqNum))
-            {
-                // It's a duplicate 
-                dup_msg_count++;
-                // TBD - keep track of dup_byte_count to report overall receive rate?
-            }
-            else if (window_valid && (dup_mask.Difference(seqNum, seq_start) < 0))
-            {
-                // It precedes our window, but mark dup_mask
-                // for duplicate message count purposes
-                dup_mask.Set(seqNum);  // doesn't matter if it succeeds
-            }
-            else
-            {
-                // It's a valid, new message, so count it
-                if (!dup_mask.Set(seqNum))
-                {
-                    // Need to force our dup_mask forward to 
-                    // (TBD - add a param to ProtoSlidingMask::Set() to do this automatically)
-                    UINT32 firstSet;
-                    dup_mask.GetFirstSet(firstSet);
-                    UINT32 numBits = dup_mask.Difference(seqNum, firstSet);
-                    dup_mask.UnsetBits(firstSet, numBits);
-                    dup_mask.Set(seqNum);
-                }
-                // Ignore size of first message (serves as time reference only) 
-                // when more than one message in window
-                if (1 == msg_count)
-                    byte_count = msgSize;  
-                else
-                    byte_count += msgSize;
-                latency = ProtoTime::Delta(rxTime, txTime);
-                if (0 == msg_count)
-                {
-                    latency_sum = latency_min = latency_max = latency;
-                }
-                else
-                {
-                    latency_sum += latency;
-                    if (latency < latency_min)
-                        latency_min = latency;
-                    else if (latency > latency_max)
-                        latency_max = latency;
-                }
-                msg_count++;
-            }
-        }
-        else
-        {
-            // First actual message received for this analytic
-            if (dup_mask.IsSet()) dup_mask.Clear(); // TBD - Is this right thing to do???
-            dup_mask.Set(seqNum);
-            seq_start = seqNum;
-            byte_count = msgSize;
-            latency_sum = latency_min = latency_max = ProtoTime::Delta(rxTime, txTime);
-            msg_count = 1;
-        }
-    }
-    
+
+    bool report_updated = false;
+
+    // 1st packet received for new window - Generate report for last window and 
+    // Reset window indices and counts before updating metrics for current
     if (rxTime >= window_end)
     {
         // Update report (also build REPORT msg into buffer)
         report_valid = true;
         report_start = window_start;
-        report_duration = ProtoTime::Delta(rxTime, window_start);
+        // Always calculate report duration as window size 
+        report_duration = window_size;
         UINT32 seqMax;
         if (!dup_mask.GetLastSet(seqMax))  // gets highest sequence number observed
             seqMax = seq_start;
-        
+
         switch (msg_count)
         {
             // Note case 0 and case 1 here will only come into play when window timeouts are implemented
@@ -200,7 +139,7 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
             }
             default:
             {
-                report_msg_count = msg_count - 1;  // don't include the first packet in the count as it was included in the previous window
+                report_msg_count = msg_count;
                 report_rate_ave = (double)byte_count / report_duration;
                 UINT32 seqDelta = seqMax - seq_start;
                 // If "seqDelta" is zero, this means _only_ a single message
@@ -215,7 +154,7 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
                         break;
                     default:
                         report_loss_ave = 1.0 - (double)msg_count / (double)(seqDelta + 1);
-                        break;   
+                        break;
                 }
                 report_latency_ave = latency_sum / (double)msg_count;
                 report_latency_min = latency_min;
@@ -223,24 +162,32 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
                 break;
             }
         }
-        
+
         // Reset window indices and counts
-        window_start = rxTime;
-        window_end = rxTime;
+        window_start += window_size; // Align next window to end of previous window to prevent drift
         window_end += window_size;
-        seq_start = seqMax;
-        if (0 != msgSize)
+
+        // Account for gaps > window_size where packets were not received
+        double rx_gap = ProtoTime::Delta(window_end,rxTime);
+        while (rx_gap < 0)
         {
-            byte_count = 0;  // the bytes for the message already accounted (ignored anyway)
-            msg_count = 1;
-            latency_sum = latency_min = latency_max = latency;
+            window_start += window_size;
+            window_end += window_size;
+
+            PLOG(PL_DEBUG, 
+                "MgenAnalytic::Update(): Detected large gap (%f).  New window start:: %f, end: %f)\n",
+                rx_gap,
+                window_start.GetValue(),
+                window_end.GetValue()
+            );
+            rx_gap = ProtoTime::Delta(window_end,rxTime);
         }
-        else
-        {
-            byte_count = msg_count = 0;
-            latency_sum = latency_min = latency_max = 0.0;
-        }
-        
+
+        seq_start = seqNum;  // sequence number of 1st msg (just received) in new window
+
+        byte_count = msg_count = 0;
+        latency_sum = latency_min = latency_max = 0.0;
+
         // Update our "report_buffer" metrics
         // TBD - make this conditional upon an initialization variable?
         // windowOffset not set until report is sent
@@ -251,10 +198,81 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
         report_msg.SetLatencyDeltaMax(report_latency_max - report_latency_ave);
         report_msg.SetRateAve(report_rate_ave);
         report_msg.SetLossFraction(report_loss_ave);
-        return true;  // report updated
+        
+        report_updated = true;
     }
-    
-    return false;  // report not updated
+
+
+    double latency = 0.0;
+
+    // Update current analytics for current window
+    if (0 != msgSize)
+    {
+        if (dup_mask.IsSet())
+        {
+            
+            // IMPORTANT TBD: manage the duplicate detector more intelligently (or limit its range, perhaps temporally)
+            if (dup_mask.Test(seqNum))
+            {
+                // It's a duplicate
+                dup_msg_count++;
+                // TBD - keep track of dup_byte_count to report overall receive rate?
+            }
+            else if (window_valid && (dup_mask.Difference(seqNum, seq_start) < 0))
+            {
+                // It precedes our window, but mark dup_mask
+                // for duplicate message count purposes
+                dup_mask.Set(seqNum);  // doesn't matter if it succeeds
+            }
+            else
+            {
+                // It's a valid, new message, so count it
+                if (!dup_mask.Set(seqNum))
+                {
+                    // Need to force our dup_mask forward to
+                    // (TBD - add a param to ProtoSlidingMask::Set() to do this automatically)
+                    UINT32 firstSet;
+                    dup_mask.GetFirstSet(firstSet);
+                    UINT32 numBits = dup_mask.Difference(seqNum, firstSet);
+                    dup_mask.UnsetBits(firstSet, numBits);
+                    dup_mask.Set(seqNum);
+                }
+                // Ignore size of first message (serves as time reference only)
+                // when more than one message in window
+                // if (1 == msg_count)
+                //     byte_count = msgSize;
+                // else
+                    byte_count += msgSize;
+                latency = ProtoTime::Delta(rxTime, txTime);
+                if (0 == msg_count)
+                {
+                    latency_sum = latency_min = latency_max = latency;
+                }
+                else
+                {
+                    latency_sum += latency;
+                    if (latency < latency_min)
+                        latency_min = latency;
+                    else if (latency > latency_max)
+                        latency_max = latency;
+                }
+                msg_count++;
+                // last_rx_time = rxTime; // Cache most recent Rx time in window
+            }
+        }
+        else
+        {
+            // First actual message received for this analytic
+            if (dup_mask.IsSet()) dup_mask.Clear(); // TBD - Is this right thing to do???
+            dup_mask.Set(seqNum);
+            seq_start = seqNum;
+            byte_count = msgSize;
+            latency_sum = latency_min = latency_max = ProtoTime::Delta(rxTime, txTime);
+            msg_count = 1;
+        }
+    }
+
+    return report_updated; 
 }  // end MgenAnalytic::Update()
 
 void MgenAnalytic::Log(FILE*            filePtr, 
@@ -784,6 +802,5 @@ void MgenAnalytic::Report::Log(FILE*                filePtr,
                 GetWindowSize(), GetRateAve()*8.0e-03, GetLossFraction(), 
                 GetLatencyAve(), GetLatencyMin(), GetLatencyMax());
 }  // end MgenAnalytic::Report::Log()
-
 
 
