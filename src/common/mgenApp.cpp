@@ -58,7 +58,7 @@ void MgenApp::Usage()
             "     [gpskey <gpsSharedMemoryLocation>]\n"
             "     [boost] [reuse {on|off}]\n"
             "     [epochtimestamp]\n"
-            "     [windowQuantize {on|off}]\n");
+            "     [windowQuantize {on|off}] [txAnalytics]\n");
 }  // end MgenApp::Usage()
 
 
@@ -85,6 +85,7 @@ const char* const MgenApp::CMD_LIST[] =
     "+loggpsdata", // log gps data? default ON
     "-epochtimestamp", // epoch timesetamps? default OFF
     "+windowQuantize", // quantize analytics window? default ON
+    "-txAnalytics",  // enables MGEN analytics reporting on send flows
 //   "-analytics",  // enables MGEN analytics reporting on received flows
     NULL
 };
@@ -491,6 +492,10 @@ bool MgenApp::OnCommand(const char* cmd, const char* val)
     DMSG(0, "MgenApp::ProcessCommand(windowQuantize) Error: wrong argument to windowQuantize:%s\n",status);
     return false;
       }
+    }
+    else if (!strncmp("txAnalytics", lowerCmd, len))
+    {
+        mgen.SetTxAnalytics(true);
     }
     else if (!strncmp("help", lowerCmd, len))
     {
@@ -941,4 +946,3 @@ bool MgenApp::ReadCmdInput(char* buffer, unsigned int& numBytes)
 
 // This macro instantiates our MgenApp instance
 PROTO_INSTANTIATE_APP(MgenApp)
-

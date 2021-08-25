@@ -134,7 +134,7 @@
      [report] [suspend &lt;flowId(s)&gt;] [resume &lt;flowId(s)&gt;] [reset &lt;flowId(s)&gt;]
      [retry &lt;count&gt;[/&lt;delay&gt;]
      [epochtimestamp]
-     [windowQuantize {on|off}]
+     [windowQuantize {on|off}][txAnalytics]
 
 </programlisting>
 

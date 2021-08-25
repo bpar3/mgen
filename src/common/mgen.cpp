@@ -112,7 +112,7 @@ Mgen::Mgen(ProtoTimerMgr&         timerMgr,
   log_data(true), log_gps_data(true),
   checksum_enable(false), 
   addr_type(ProtoAddress::IPv4), 
-  analytic_window(MgenAnalytic::DEFAULT_WINDOW),
+  analytic_window(MgenAnalytic::DEFAULT_WINDOW), tx_analytics(false),
   compute_analytics(false), report_analytics(false),window_quantize(true),
   get_position(NULL), get_position_data(NULL),
   log_file(NULL), log_binary(false), local_time(false), log_flush(false), 
@@ -1024,6 +1024,46 @@ void Mgen::RemoveAnalytic(Protocol                protocol,
     delete analytic;
 }  // end Mgen::RemoveAnalytic()
 
+void Mgen::UpdateSendAnalytics(MgenMsg* theMsg)
+{
+    if (!tx_analytics) return;
+    if (NULL == theMsg) return;
+    MgenAnalytic* analytic = analytic_table.FindFlow(theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId());
+    if (NULL == analytic)
+    {
+        if (NULL == (analytic = new MgenAnalytic()))
+        {
+            PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() new MgenAnalytic() error: %s\n", GetErrorString());
+            return;
+        }
+        if (!analytic->Init(theMsg->GetProtocol(), theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId(), window_quantize, analytic_window))
+        {
+            PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() MgenAnalytic() initialization error: %s\n", GetErrorString());
+            return;
+        }
+        if (!analytic_table.Insert(*analytic))
+        {
+            PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() unable to add new flow analytic: %s\n", GetErrorString());
+            delete analytic;
+            return;
+        }
+    }
+
+    if (analytic->TxUpdate(theMsg->GetMsgLen(), ProtoTime(theMsg->GetTxTime()), theMsg->GetSeqNum()))
+    {
+        // MgenFlow* nextFlow = flow_list.Head();
+        // while (NULL != nextFlow)
+        // {
+        //     if (nextFlow->GetReportAnalytics())
+        //         nextFlow->UpdateAnalyticReport(*analytic);
+        //     nextFlow = flow_list.GetNext(nextFlow);
+        // }       
+        // const MgenAnalytic::Report& report = analytic->GetReport(theTime);
+        // if (NULL != controller)  // e.g., Mgendr GUI
+        //     controller->OnUpdateReport(theTime, report);
+        analytic->TxLog(log_file, ProtoTime(theMsg->GetTxTime()), local_time);
+    }    
+}
 
 void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protocol theProtocol)
 {
@@ -1227,6 +1267,7 @@ bool Mgen::ParseEvent(const char* lineBuffer, unsigned int lineCount, bool inter
                            GetErrorString());   
                       return false;
                   }
+                  theFlow->SetTxAnalytics(tx_analytics);
                   theFlow->SetReportAnalytics(report_analytics);
                   theFlow->SetPositionCallback(get_position, get_position_data);
 #ifdef HAVE_GPS
@@ -1356,6 +1397,7 @@ bool Mgen::ProcessMgenEvent(const MgenEvent& event)
             return false;
         }
         // Set any flow global defaults
+        theFlow->SetTxAnalytics(tx_analytics);
         theFlow->SetReportAnalytics(report_analytics);
         theFlow->SetPositionCallback(get_position, get_position_data);
 #ifdef HAVE_GPS
@@ -1443,6 +1485,7 @@ const StringMapper Mgen::COMMAND_LIST[] =
     {"+QUEUE",      QUEUE},
     {"+REUSE",      REUSE},
     {"-ANALYTICS",  ANALYTICS},
+    {"-TXANALYTICS",  TXANALYTICS},
     {"-REPORT",     REPORT},
     {"+WINDOW",     WINDOW},
     {"+SUSPEND",    SUSPEND},
@@ -1910,6 +1953,10 @@ bool Mgen::OnCommand(Mgen::Command cmd, const char* arg, bool override)
       
     case ANALYTICS:
         compute_analytics = true;
+        break;
+      
+    case TXANALYTICS:
+        tx_analytics = true;
         break;
         
     case REPORT:

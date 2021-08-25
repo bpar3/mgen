@@ -93,6 +93,10 @@ class MgenFlow
 	void RestartTimer();
 	ProtoTimer& GetTxTimer() {return tx_timer;}
 	int QueueLimit() {return queue_limit;}
+    void SetTxAnalytics(bool state)
+        {tx_analytics = state;}
+    bool GetTxAnalytics() const
+        {return tx_analytics;}
     void SetReportAnalytics(bool state)
         {report_analytics = state;}
     bool GetReportAnalytics() const
@@ -137,6 +141,7 @@ class MgenFlow
     
     MgenFlowCommand         flow_command;  // state for MgenFlowCommand being sent (if any)
     UINT32                  command_buffer[12/4]; // for 40 flows, command is 12-bytes
+    bool                    tx_analytics;
     bool                    report_analytics;
     bool                    report_feedback;
     MgenAnalyticReporter    analytic_reporter;  

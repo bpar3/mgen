@@ -82,6 +82,188 @@ bool MgenAnalytic::Init(Protocol               protocol,
 }  // end MgenAnalytic::Init()
 
 
+bool MgenAnalytic::TxUpdate(unsigned int     msgSize,
+                          const ProtoTime& txTime,
+                          UINT32           seqNum)
+{
+   if (!window_valid)
+   {
+        // First event for this flow, so initialize the analytic
+        window_valid = true;
+        window_start = txTime;
+        window_end = window_start;
+        window_end += window_size;
+        if (0 != msgSize)
+        {
+            dup_mask.Set(seqNum);
+            seq_start = seqNum;
+            msg_count = 1;
+            byte_count = msgSize;
+        }
+        else
+        {
+            msg_count = byte_count = 0;
+            latency_sum = latency_min = latency_max = 0.0;
+        }
+        return false;  
+    }
+
+    bool report_updated = false;
+
+    // 1st packet received for new window - Generate report for last window and 
+    // Reset window indices and counts before updating metrics for current
+    if (txTime >= window_end)
+    {
+        // Update report (also build REPORT msg into buffer)
+        report_valid = true;
+        report_start = window_start;
+        // Always calculate report duration as window size 
+        report_duration = window_size;
+
+        switch (msg_count)
+        {
+            // Note case 0 and case 1 here will only come into play when window timeouts are implemented
+            // At the moment, the MgenAnalytic is completely event-driven by received messages for the flow
+            case 0:
+            {
+                report_msg_count = 0;
+                report_rate_ave = 0.0;
+                break;
+            }
+            case 1:
+            {
+                // one-shot report (only a single message for window)
+                report_msg_count = 1;
+                report_rate_ave = (double)byte_count / report_duration;
+                break;
+            }
+            default:
+            {
+                report_msg_count = msg_count;
+                report_rate_ave = (double)byte_count / report_duration;
+                break;
+            }
+        }
+
+        // Reset window indices and counts
+        window_start += window_size; // Align next window to end of previous window to prevent drift
+        window_end += window_size;
+
+        // Account for gaps > window_size where packets were not received
+        double tx_gap = ProtoTime::Delta(window_end,txTime);
+        while (tx_gap < 0)
+        {
+            window_start += window_size;
+            window_end += window_size;
+
+            PLOG(PL_DEBUG, 
+                "MgenAnalytic::TxUpdate(): Detected large gap (%f).  New window start:: %f, end: %f)\n",
+                tx_gap,
+                window_start.GetValue(),
+                window_end.GetValue()
+            );
+            tx_gap = ProtoTime::Delta(window_end,txTime);
+        }
+
+        seq_start = seqNum;  // sequence number of 1st msg (just received) in new window
+
+        byte_count = msg_count = 0;
+
+        // Update our "report_buffer" metrics
+        // TBD - make this conditional upon an initialization variable?
+        // windowOffset not set until report is sent
+        report_msg.SetWindowSize(report_duration);
+        report_msg.SetRateAve(report_rate_ave);
+        
+        report_updated = true;
+    }
+
+    // Update current analytics for current window
+    if (0 != msgSize)
+    {
+        if (dup_mask.IsSet())
+        {
+            
+            // IMPORTANT TBD: manage the duplicate detector more intelligently (or limit its range, perhaps temporally)
+            if (dup_mask.Test(seqNum))
+            {
+                // It's a duplicate
+                dup_msg_count++;
+                // TBD - keep track of dup_byte_count to report overall receive rate?
+            }
+            else if (window_valid && (dup_mask.Difference(seqNum, seq_start) < 0))
+            {
+                // It precedes our window, but mark dup_mask
+                // for duplicate message count purposes
+                dup_mask.Set(seqNum);  // doesn't matter if it succeeds
+            }
+            else
+            {
+                // It's a valid, new message, so count it
+                if (!dup_mask.Set(seqNum))
+                {
+                    // Need to force our dup_mask forward to
+                    // (TBD - add a param to ProtoSlidingMask::Set() to do this automatically)
+                    UINT32 firstSet;
+                    dup_mask.GetFirstSet(firstSet);
+                    UINT32 numBits = dup_mask.Difference(seqNum, firstSet);
+                    dup_mask.UnsetBits(firstSet, numBits);
+                    dup_mask.Set(seqNum);
+                }
+
+                byte_count += msgSize;
+                msg_count++;
+            }
+        }
+        else
+        {
+            // First actual message received for this analytic
+            if (dup_mask.IsSet()) dup_mask.Clear(); // TBD - Is this right thing to do???
+            dup_mask.Set(seqNum);
+            seq_start = seqNum;
+            byte_count = msgSize;
+            msg_count = 1;
+        }
+    }
+
+    return report_updated; 
+}  // end MgenAnalytic::TxUpdate()
+
+void MgenAnalytic::TxLog(FILE*            filePtr, 
+                       const ProtoTime& txTime, 
+                       bool             localTime) const
+{
+    if (NULL == filePtr) return;  // not logging
+    // MGEN logging timestamp format (TBD - create an Mgen::LogTimeStamp() method
+    Mgen::LogTimestamp(filePtr, txTime.GetTimeVal(), localTime);
+    UINT32 flowId = report_msg.GetFlowId();
+    if (0 == flowId) flowId = 1;  // null flowId means flow 1 by default
+    ProtoAddress srcAddr;
+    report_msg.GetSrcAddr(srcAddr);
+    const char* protocol = "???";
+    switch(report_msg.GetProtocol())
+    {
+        case UDP:
+            protocol = "UDP";
+            break;
+        case TCP:
+            protocol = "TCP";
+            break;
+        case SINK:
+            protocol = "SINK";
+            break;
+        default:
+            protocol = "???";
+            break;
+    }
+    Mgen::Log(filePtr, "TXREPORT proto>%s flow>%lu srcPort>%hu ", protocol, flowId, srcAddr.GetPort());
+    ProtoAddress dstAddr;
+    report_msg.GetDstAddr(dstAddr);
+    Mgen::Log(filePtr, "dst>%s/%hu ", dstAddr.GetHostString(), dstAddr.GetPort());
+    Mgen::Log(filePtr,"window>%lf rate>%lf kbps, count>%u\n",
+                report_duration, report_rate_ave*8.0e-03, report_msg_count);
+}  // end void MgenAnalytic:::TxLog()
+
 bool MgenAnalytic::Update(const ProtoTime& rxTime,
                           unsigned int     msgSize,
                           const ProtoTime& txTime,
@@ -813,5 +995,4 @@ void MgenAnalytic::Report::Log(FILE*                filePtr,
                 GetWindowSize(), GetRateAve()*8.0e-03, GetLossFraction(), 
                 GetLatencyAve(), GetLatencyMin(), GetLatencyMax());
 }  // end MgenAnalytic::Report::Log()
-
 

@@ -1058,6 +1058,7 @@ MessageStatus MgenUdpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
       }
 
     LogEvent(SEND_EVENT, &theMsg,theMsg.GetTxTime(), txBuffer);
+    mgen.UpdateSendAnalytics(&theMsg);
     return MSG_SEND_OK;
 
 } // end MgenUdpTransport::SendMessage
@@ -1390,6 +1391,7 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
                 tx_msg.SetTxTime(tx_time);
                 tx_msg.Pack(txBuffer, MAX_SIZE, mgen.GetChecksumEnable(), txChecksum);
                 LogEvent(SEND_EVENT ,&tx_msg,tx_time, txBuffer);
+                mgen.UpdateSendAnalytics(&tx_msg);
                 ResetTxMsgState();
                 StopOutputNotification(); // ljt 0516 - check if we need this?
                 // we may still have pending stuff!
@@ -1803,6 +1805,7 @@ bool MgenTcpTransport::GetNextTxBuffer(unsigned int numBytes)
             tx_msg.SetTxTime(tx_time);
             tx_msg.Pack(txBuffer, MAX_SIZE,mgen.GetChecksumEnable(),txChecksum);
             LogEvent(SEND_EVENT,&tx_msg,tx_time,txBuffer); 
+            mgen.UpdateSendAnalytics(&tx_msg);
             ResetTxMsgState();    
             return false;
         }
@@ -2189,6 +2192,5 @@ void MgenTransport::ProcessRecvMessage(MgenMsg& msg, const ProtoTime& theTime)
         }
     }
 }  // end MgenTransport::ProcessRecvMessage()
-
 
 

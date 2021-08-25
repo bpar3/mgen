@@ -89,6 +89,15 @@ class MgenAnalytic : public ProtoQueue::Item
         }
         
         // returns "true" when report values have been updated
+        bool TxUpdate(unsigned int     msgSize = 0,
+                    const ProtoTime& txTime = ProtoTime(0.0),
+                    UINT32           seqNum = 0);
+        
+        void TxLog(FILE*            filePtr, 
+                 const ProtoTime& txTime, 
+                 bool             localTime) const;
+        
+        // returns "true" when report values have been updated
         bool Update(const ProtoTime& rxTime,
                     unsigned int     msgSize = 0,
                     const ProtoTime& txTime = ProtoTime(0.0),
