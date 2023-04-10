@@ -321,7 +321,7 @@ class Mgen
     
     bool IsStarted () {return started;};
     
-    void UpdateSendAnalytics(MgenMsg* theMsg = NULL);
+    void UpdateSendAnalytics(const struct timeval& theTime, UINT16 msg_len = 0, MgenMsg* theMsg = NULL);
     void UpdateRecvAnalytics(const ProtoTime& currentTime, MgenMsg* theMsg = NULL, Protocol theProtocol = UDP);
     
     MgenTransport* GetMgenTransport(Protocol theProtocol,

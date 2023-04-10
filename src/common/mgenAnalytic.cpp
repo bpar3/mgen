@@ -149,7 +149,7 @@ bool MgenAnalytic::TxUpdate(unsigned int     msgSize,
         window_start += window_size; // Align next window to end of previous window to prevent drift
         window_end += window_size;
 
-        // Account for gaps > window_size where packets were not received
+        // Account for gaps > window_size where packets were not sent
         double tx_gap = ProtoTime::Delta(window_end,txTime);
         while (tx_gap < 0)
         {

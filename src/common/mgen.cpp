@@ -1024,7 +1024,7 @@ void Mgen::RemoveAnalytic(Protocol                protocol,
     delete analytic;
 }  // end Mgen::RemoveAnalytic()
 
-void Mgen::UpdateSendAnalytics(MgenMsg* theMsg)
+void Mgen::UpdateSendAnalytics(const struct timeval& tx_time, UINT16 msg_len, MgenMsg* theMsg)
 {
     if (!tx_analytics) return;
     if (NULL == theMsg) return;
@@ -1049,7 +1049,7 @@ void Mgen::UpdateSendAnalytics(MgenMsg* theMsg)
         }
     }
 
-    if (analytic->TxUpdate(theMsg->GetMsgLen(), ProtoTime(theMsg->GetTxTime()), theMsg->GetSeqNum()))
+    if (analytic->TxUpdate(msg_len, ProtoTime(tx_time), theMsg->GetSeqNum()))
     {
         // MgenFlow* nextFlow = flow_list.Head();
         // while (NULL != nextFlow)
