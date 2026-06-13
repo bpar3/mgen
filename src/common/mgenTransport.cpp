@@ -1058,6 +1058,7 @@ MessageStatus MgenUdpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
       }
 
     LogEvent(SEND_EVENT, &theMsg,theMsg.GetTxTime(), txBuffer);
+    mgen.UpdateSendAnalytics(theMsg.GetTxTime(), theMsg.GetMgenMsgLen(), &theMsg);
     return MSG_SEND_OK;
 
 } // end MgenUdpTransport::SendMessage
@@ -1390,6 +1391,11 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
                 tx_msg.SetTxTime(tx_time);
                 tx_msg.Pack(txBuffer, MAX_SIZE, mgen.GetChecksumEnable(), txChecksum);
                 LogEvent(SEND_EVENT ,&tx_msg,tx_time, txBuffer);
+                // Create TX analytics entry once the entire message has been
+                // transmitted.  Use the length of the entire mgen message
+                // (mgen_msg_len survives fragmentation) and the TX time of the
+                // first fragment sent.
+                mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg);
                 ResetTxMsgState();
                 StopOutputNotification(); // ljt 0516 - check if we need this?
                 // we may still have pending stuff!
@@ -1802,8 +1808,13 @@ bool MgenTcpTransport::GetNextTxBuffer(unsigned int numBytes)
             // the tx_time passed in.  Should be cleaned up.
             tx_msg.SetTxTime(tx_time);
             tx_msg.Pack(txBuffer, MAX_SIZE,mgen.GetChecksumEnable(),txChecksum);
-            LogEvent(SEND_EVENT,&tx_msg,tx_time,txBuffer); 
-            ResetTxMsgState();    
+            LogEvent(SEND_EVENT,&tx_msg,tx_time,txBuffer);
+            // Create TX analytics entry once the entire message has been
+            // transmitted via the asynchronous (socket-notification) send path.
+            // tx_msg.GetMsgLen() has been zeroed by fragmentation here, so use
+            // mgen_msg_len (the full message length) and the first-fragment TX time.
+            mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg);
+            ResetTxMsgState();
             return false;
         }
         //ljt 033108 - triger pending messages to get sent??

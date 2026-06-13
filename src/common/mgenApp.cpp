@@ -58,7 +58,7 @@ void MgenApp::Usage()
             "     [gpskey <gpsSharedMemoryLocation>]\n"
             "     [boost] [reuse {on|off}]\n"
             "     [epochtimestamp]\n"
-            "     [quantizeWindow {on|off}]\n");
+            "     [quantizeWindow {on|off}] [txAnalytics]\n");
 }  // end MgenApp::Usage()
 
 
@@ -84,6 +84,7 @@ const char* const MgenApp::CMD_LIST[] =
     "+logdata",    // log optional data attribute? default ON
     "+loggpsdata", // log gps data? default ON
     "-epochtimestamp", // epoch timesetamps? default OFF
+    "-txAnalytics",  // enables MGEN analytics reporting on send flows
 //   "-analytics",  // enables MGEN analytics reporting on received flows
     NULL
 };
@@ -472,6 +473,10 @@ bool MgenApp::OnCommand(const char* cmd, const char* val)
     else if (!strncmp("epochtimestamp", lowerCmd, len))
     {
         mgen.SetEpochTimestamp(true);
+    }
+    else if (!strncmp("txAnalytics", lowerCmd, len))
+    {
+        mgen.SetTxAnalytics(true);
     }
     else if (!strncmp("help", lowerCmd, len))
     {

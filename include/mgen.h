@@ -162,6 +162,7 @@ class Mgen
       QUEUE,     // Turn off tx_timer when pending queue exceeds this limit
       REUSE,     // Toggle socket reuse on and off
       ANALYTICS, // Turns on compute of analytics (and logging if enabled)
+      TXANALYTICS,// Turns on transmit summary reports (similar to Rx analytics reports)
       REPORT,    // Include analytic reports in message payloads for all flows
       WINDOW,    // specifies analytic averaging window size (seconds)
       SUSPEND,
@@ -226,6 +227,10 @@ class Mgen
     
     void InsertDrecEvent(DrecEvent* event);
 
+    void SetTxAnalytics(bool state)
+        {tx_analytics = state;}
+    bool TxAnalytics() const
+        {return tx_analytics;}
     void SetComputeAnalytics(bool state)
         {compute_analytics = true;}
     bool ComputeAnalytics() const
@@ -315,6 +320,7 @@ class Mgen
     
     bool IsStarted () {return started;};
     
+    void UpdateSendAnalytics(const struct timeval& theTime, unsigned int msg_len = 0, MgenMsg* theMsg = NULL);
     void UpdateRecvAnalytics(const ProtoTime& currentTime, MgenMsg* theMsg = NULL, Protocol theProtocol = UDP);
     
     MgenTransport* GetMgenTransport(Protocol theProtocol,
@@ -547,6 +553,7 @@ class Mgen
     ProtoAddress::Type addr_type;
     MgenAnalyticTable  analytic_table;
     double             analytic_window;
+    bool               tx_analytics;      // measure and log analytics for send flows
     bool               compute_analytics; // measure and log analytics for recv flows
     bool               report_analytics;  // include analytic reports in message payload for all flows
     bool               window_quantize;   // quantize analytics window size

@@ -112,7 +112,7 @@ Mgen::Mgen(ProtoTimerMgr&         timerMgr,
   checksum_enable(false), 
   addr_type(ProtoAddress::IPv4), 
   analytic_window(MgenAnalytic::DEFAULT_WINDOW),
-  compute_analytics(false), report_analytics(false), window_quantize(true),
+  tx_analytics(false), compute_analytics(false), report_analytics(false), window_quantize(true),
   get_position(NULL), get_position_data(NULL),
   log_file(NULL), log_binary(false), local_time(false), log_flush(false), 
   log_file_lock(false), log_tx(false), log_rx(true), log_open(false), log_empty(true),
@@ -1024,6 +1024,37 @@ void Mgen::RemoveAnalytic(Protocol                protocol,
 }  // end Mgen::RemoveAnalytic()
 
 
+void Mgen::UpdateSendAnalytics(const struct timeval& tx_time, unsigned int msg_len, MgenMsg* theMsg)
+{
+    if (!tx_analytics) return;
+    if (NULL == theMsg) return;
+    MgenAnalytic* analytic = analytic_table.FindFlow(theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId());
+    if (NULL == analytic)
+    {
+        if (NULL == (analytic = new MgenAnalytic()))
+        {
+            PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() new MgenAnalytic() error: %s\n", GetErrorString());
+            return;
+        }
+        if (!analytic->Init(theMsg->GetProtocol(), theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId(), window_quantize, analytic_window))
+        {
+            PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() MgenAnalytic() initialization error: %s\n", GetErrorString());
+            return;
+        }
+        if (!analytic_table.Insert(*analytic))
+        {
+            PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() unable to add new flow analytic: %s\n", GetErrorString());
+            delete analytic;
+            return;
+        }
+    }
+
+    if (analytic->TxUpdate(msg_len, ProtoTime(tx_time), theMsg->GetSeqNum()))
+    {
+        analytic->TxLog(log_file, ProtoTime(theMsg->GetTxTime()), local_time);
+    }
+}  // end Mgen::UpdateSendAnalytics()
+
 void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protocol theProtocol)
 {
     // This is a work in progress.  Eventually an option to report back measured
@@ -1442,6 +1473,7 @@ const StringMapper Mgen::COMMAND_LIST[] =
     {"+QUEUE",      QUEUE},
     {"+REUSE",      REUSE},
     {"-ANALYTICS",  ANALYTICS},
+    {"-TXANALYTICS", TXANALYTICS},
     {"-REPORT",     REPORT},
     {"+WINDOW",     WINDOW},
     {"+SUSPEND",    SUSPEND},
@@ -1910,7 +1942,11 @@ bool Mgen::OnCommand(Mgen::Command cmd, const char* arg, bool override)
     case ANALYTICS:
         compute_analytics = true;
         break;
-        
+
+    case TXANALYTICS:
+        tx_analytics = true;
+        break;
+
     case REPORT:
         report_analytics = true;
         compute_analytics = true;
