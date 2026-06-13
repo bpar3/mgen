@@ -75,9 +75,10 @@ class MgenAnalytic : public ProtoQueue::Item
         
         // Init() MUST be called before analytic can be updated
         bool Init(Protocol               protocol,
-                  const ProtoAddress&    srcAddr, 
-                  const ProtoAddress&    dstAddr, 
-                  UINT32                 flowId, 
+                  const ProtoAddress&    srcAddr,
+                  const ProtoAddress&    dstAddr,
+                  UINT32                 flowId,
+                  bool                   windowQuantize,
                   double                 windowSize = MgenAnalytic::DEFAULT_WINDOW,
                   UINT32                 historyDepth = MgenAnalytic::DEFAULT_HISTORY);
         

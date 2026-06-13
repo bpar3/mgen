@@ -57,7 +57,8 @@ void MgenApp::Usage()
             "     [convert <binaryLog>][debug <debugLevel>]\n"
             "     [gpskey <gpsSharedMemoryLocation>]\n"
             "     [boost] [reuse {on|off}]\n"
-            "     [epochtimestamp]\n");
+            "     [epochtimestamp]\n"
+            "     [quantizeWindow {on|off}]\n");
 }  // end MgenApp::Usage()
 
 
