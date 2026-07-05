@@ -1,15 +1,22 @@
 
 #include "mgenAnalytic.h"
 #include "mgen.h"  // for logging
+#include "protoSocket.h"  // for TX wire-rate send-queue query
 #include <string.h>  // for memcpy()
+#ifdef LINUX
+#include <sys/ioctl.h>     // for ioctl()
+#include <linux/sockios.h> // for SIOCOUTQ
+#endif // LINUX
 
 const double MgenAnalytic::DEFAULT_WINDOW = 1.0;
 
 MgenAnalytic::MgenAnalytic()
- : flow_key(NULL), flow_keysize(0), window_size(DEFAULT_WINDOW), window_valid(false), 
-   msg_count(0), byte_count(0), dup_msg_count(0), latency_sum(0.0), 
+ : flow_key(NULL), flow_keysize(0), window_size(DEFAULT_WINDOW), window_valid(false),
+   msg_count(0), byte_count(0), dup_msg_count(0), latency_sum(0.0),
+   tx_socket(NULL), tx_wire_rate(false), tx_written_total(0),
+   tx_written_prev(0), tx_queue_prev(0),
    report_valid(false), report_msg_count(0)
-{ 
+{
     // Adjust set window_size to quantized version
     UINT8 q = Report::QuantizeTimeValue(window_size);
     window_size = Report::UnquantizeTimeValue(q);

@@ -11,6 +11,8 @@
 
 #include <math.h>  // for fabs()
 
+class ProtoSocket;  // forward decl (for TX wire-rate socket query)
+
 // MGEN_DATA analytic report format
 // 
 //       0                   1                   2                   3
@@ -88,8 +90,10 @@ class MgenAnalytic : public ProtoQueue::Item
             window_size = MgenAnalytic::Report::UnquantizeTimeValue(q);
         }
         
-        // returns "true" when report values have been updated
-        bool TxUpdate(unsigned int     msgSize = 0,
+        // Accumulate a transmitted message into the current window.
+        // (Window rolling and report emission are driven by the periodic
+        //  analytic timer via FinalizeTxWindow(), not by this call.)
+        void TxUpdate(unsigned int     msgSize = 0,
                     const ProtoTime& txTime = ProtoTime(0.0),
                     UINT32           seqNum = 0);
 
@@ -97,21 +101,45 @@ class MgenAnalytic : public ProtoQueue::Item
                  const ProtoTime& txTime,
                  bool             localTime) const;
 
-        // returns "true" when report values have been updated
-        bool Update(const ProtoTime& rxTime,
+        // Accumulate a received message into the current window.
+        // (Window rolling and report emission are driven by the periodic
+        //  analytic timer via FinalizeRxWindow(), not by this call.)
+        void Update(const ProtoTime& rxTime,
                     unsigned int     msgSize = 0,
                     const ProtoTime& txTime = ProtoTime(0.0),
                     UINT32           seqNum = 0);
-        
-        void Log(FILE*            filePtr, 
-                 const ProtoTime& sentTime, 
-                 const ProtoTime& theTime, 
+
+        void Log(FILE*            filePtr,
+                 const ProtoTime& sentTime,
+                 const ProtoTime& theTime,
                  bool             localTime) const;
-        
+
+        // Finalize the current window into the "report_*" results (and the
+        // report_msg buffer), then reset counts and advance the window by
+        // one window_size.  Called once per elapsed window by the timer.
+        void FinalizeTxWindow();  // transmit-side (rate/count [+ wire rate])
+        void FinalizeRxWindow();  // receive-side (rate/count/loss/latency)
+
+        // True when the current window has fully elapsed as of "now"
+        bool WindowElapsed(const ProtoTime& now) const
+            {return (window_valid && (now >= window_end));}
+        bool HasWindow() const
+            {return window_valid;}
+
+        // TX wire-rate accounting (see FinalizeTxWindow())
+        void SetTxSocket(ProtoSocket* theSocket)
+            {tx_socket = theSocket;}
+        void ClearTxSocket()
+            {tx_socket = NULL;}
+        ProtoSocket* GetTxSocket() const
+            {return tx_socket;}
+        void SetTxWireRate(bool state)
+            {tx_wire_rate = state;}
+
         const Report& GetReport(const ProtoTime& theTime);
         const ProtoTime& GetReportTime() const
             {return report_time;}
-        
+
         const ProtoTime& GetWindowEnd() const
             {return window_end;}
         
@@ -374,7 +402,15 @@ class MgenAnalytic : public ProtoQueue::Item
         double              latency_sum;
         double              latency_min;
         double              latency_max;
-        
+
+        // TX wire-rate accounting (bytes actually drained from the kernel
+        // send buffer, sampled via SIOCOUTQ in FinalizeTxWindow()).
+        ProtoSocket*        tx_socket;         // NULL for UDP / when not tracking
+        bool                tx_wire_rate;      // report wire rate vs. offered load
+        unsigned long       tx_written_total;  // cumulative bytes handed to socket
+        unsigned long       tx_written_prev;   // snapshot at previous window boundary
+        unsigned long       tx_queue_prev;     // send-queue occupancy at prev boundary
+
         // Results of previous analytic
         bool                report_valid;
         ProtoTime           report_start;
