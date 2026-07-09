@@ -91,20 +91,26 @@ class MgenAnalytic : public ProtoQueue::Item
         }
         
         // Accumulate a transmitted message into the current window.
-        // (Window rolling and report emission are driven by the periodic
-        //  analytic timer via FinalizeTxWindow(), not by this call.)
-        void TxUpdate(unsigned int     msgSize = 0,
-                    const ProtoTime& txTime = ProtoTime(0.0),
-                    UINT32           seqNum = 0);
+        // Window boundaries are aligned to integral multiples of
+        // "window_size" and rolling / report emission are driven by
+        // the analytic timer via FinalizeTxWindow().  The return
+        // value is retained for backward compatibility, but is
+        // always "false" in timer-driven mode.
+        bool TxUpdate(unsigned int     msgSize = 0,
+                      const ProtoTime& txTime = ProtoTime(0.0),
+                      UINT32           seqNum = 0);
 
         void TxLog(FILE*            filePtr,
                  const ProtoTime& txTime,
                  bool             localTime) const;
 
         // Accumulate a received message into the current window.
-        // (Window rolling and report emission are driven by the periodic
-        //  analytic timer via FinalizeRxWindow(), not by this call.)
-        void Update(const ProtoTime& rxTime,
+        // Window boundaries are aligned to integral multiples of
+        // "window_size" and rolling / report emission are driven by
+        // the analytic timer via FinalizeRxWindow().  The return
+        // value is retained for backward compatibility, but is
+        // always "false" in timer-driven mode.
+        bool Update(const ProtoTime& rxTime,
                     unsigned int     msgSize = 0,
                     const ProtoTime& txTime = ProtoTime(0.0),
                     UINT32           seqNum = 0);
@@ -135,6 +141,10 @@ class MgenAnalytic : public ProtoQueue::Item
             {return tx_socket;}
         void SetTxWireRate(bool state)
             {tx_wire_rate = state;}
+
+        // Accumulate number of bytes written into the socket send buffer.
+        void AddTxWrittenBytes(unsigned long byteCount)
+            {tx_written_total += byteCount;}
 
         const Report& GetReport(const ProtoTime& theTime);
         const ProtoTime& GetReportTime() const

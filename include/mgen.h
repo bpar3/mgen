@@ -171,8 +171,9 @@ class Mgen
       PAUSE,     // Pauses flow while tcp attempts to reconnect
       RECONNECT, // Enables TCP reconnect
       EPOCH_TIMESTAMP, // Log timetamp as epoch time in sec.usec format
-      WINDOW_QUANTIZE, // quantize analytics window size
-      RESET
+       WINDOW_QUANTIZE, // quantize analytics window size
+       TX_WIRE_RATE,    // enable TCP TX wire-rate accounting
+       RESET
     };
 
     static Command GetCommandFromString(const char* string);
@@ -320,7 +321,17 @@ class Mgen
     
     bool IsStarted () {return started;};
     
-    void UpdateSendAnalytics(const struct timeval& theTime, unsigned int msg_len = 0, MgenMsg* theMsg = NULL);
+    void UpdateSendAnalytics(const struct timeval& theTime,
+                             unsigned int         msg_len = 0,
+                             MgenMsg*             theMsg = NULL,
+                             ProtoSocket*         txSocket = NULL);
+
+    // Helper for multi-flow-per-socket detection. Called internally.
+    void HandleTxWireRateSocketSharing(ProtoSocket* socket, MgenAnalytic* newAnalytic);
+    // Null out any TX analytic's cached socket pointer when the owning
+    // transport/socket is destroyed (prevents a dangling pointer in the
+    // analytic timer's wire-rate query).  Called from transport teardown.
+    void ClearTxAnalyticSocket(ProtoSocket* socket);
     void UpdateRecvAnalytics(const ProtoTime& currentTime, MgenMsg* theMsg = NULL, Protocol theProtocol = UDP);
     
     MgenTransport* GetMgenTransport(Protocol theProtocol,
@@ -393,10 +404,19 @@ class Mgen
                         const ProtoAddress&     srcAddr,
                         const ProtoAddress&     dstAddr,
                         UINT32                  flowId);
+    void RemoveTxAnalytic(Protocol                protocol,
+                          const ProtoAddress&     srcAddr,
+                          const ProtoAddress&     dstAddr,
+                          UINT32                  flowId);
 
     void SetAnalyticWindow(double windowSize);
+    void SetTxAnalyticWindow(double windowSize); // For TX table
     double GetAnalyticWindow() const
         {return analytic_window;}
+    void SetTxWireRate(bool state)
+        {tx_wire_rate = state;}
+    bool GetTxWireRate() const
+        {return tx_wire_rate;}
     bool GetDefaultBroadcast() {return default_broadcast;}
     unsigned int GetDefaultMulticastTtl() {return default_multicast_ttl;}
     unsigned int GetDefaultUnicastTtl() {return default_unicast_ttl;}
@@ -485,6 +505,10 @@ class Mgen
     
     bool OnStartTimeout(ProtoTimer& theTimer);
     bool OnDrecEventTimeout(ProtoTimer& theTimer);
+    bool OnAnalyticTimeout(ProtoTimer& theTimer);
+    // Activate the periodic analytic timer (aligned to the next window
+    // boundary) if analytics are enabled and it is not already running.
+    void ActivateAnalyticTimer();
 
     // Common state
 	MgenController*    controller; // optional mgen controller
@@ -551,12 +575,15 @@ class Mgen
     DrecEvent*         next_drec_event;      // for iterating drec_event_list
     DrecGroupList      drec_group_list;
     ProtoAddress::Type addr_type;
-    MgenAnalyticTable  analytic_table;
+    ProtoTimer         analytic_timer;   // timer-driven analytic reporting
+    MgenAnalyticTable  analytic_table;   // RX analytics
+    MgenAnalyticTable  tx_analytic_table; // TX analytics
     double             analytic_window;
     bool               tx_analytics;      // measure and log analytics for send flows
     bool               compute_analytics; // measure and log analytics for recv flows
     bool               report_analytics;  // include analytic reports in message payload for all flows
     bool               window_quantize;   // quantize analytics window size
+    bool               tx_wire_rate;      // enable TCP wire-rate accounting for TXREPORT
     MgenEvent::FlowStatus flow_status;    // keeps state for received MgenFlowCommands
     
     MgenPositionFunc*  get_position;

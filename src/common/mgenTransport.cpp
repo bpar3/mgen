@@ -530,7 +530,9 @@ MgenSocketTransport::MgenSocketTransport(Mgen& theMgen,
 
 MgenSocketTransport::~MgenSocketTransport()
 {
-
+    // Drop any TX analytic references to this soon-to-be-destroyed socket so
+    // the analytic timer's wire-rate query never dereferences a dangling ptr.
+    mgen.ClearTxAnalyticSocket(&socket);
 }
 void MgenSocketTransport::SetEventOptions(const MgenEvent* event)
 {              
@@ -1058,7 +1060,9 @@ MessageStatus MgenUdpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
       }
 
     LogEvent(SEND_EVENT, &theMsg,theMsg.GetTxTime(), txBuffer);
-    mgen.UpdateSendAnalytics(theMsg.GetTxTime(), theMsg.GetMgenMsgLen(), &theMsg);
+    // UDP: no wire-rate accounting (offered==transmitted), so we
+    // pass a NULL socket here.
+    mgen.UpdateSendAnalytics(theMsg.GetTxTime(), theMsg.GetMgenMsgLen(), &theMsg, NULL);
     return MSG_SEND_OK;
 
 } // end MgenUdpTransport::SendMessage
@@ -1395,7 +1399,7 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
                 // transmitted.  Use the length of the entire mgen message
                 // (mgen_msg_len survives fragmentation) and the TX time of the
                 // first fragment sent.
-                mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg);
+                mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg, &socket);
                 ResetTxMsgState();
                 StopOutputNotification(); // ljt 0516 - check if we need this?
                 // we may still have pending stuff!
@@ -1813,7 +1817,7 @@ bool MgenTcpTransport::GetNextTxBuffer(unsigned int numBytes)
             // transmitted via the asynchronous (socket-notification) send path.
             // tx_msg.GetMsgLen() has been zeroed by fragmentation here, so use
             // mgen_msg_len (the full message length) and the first-fragment TX time.
-            mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg);
+            mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg, &socket);
             ResetTxMsgState();
             return false;
         }
@@ -2200,6 +2204,5 @@ void MgenTransport::ProcessRecvMessage(MgenMsg& msg, const ProtoTime& theTime)
         }
     }
 }  // end MgenTransport::ProcessRecvMessage()
-
 
 

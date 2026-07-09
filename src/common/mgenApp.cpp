@@ -56,9 +56,10 @@ void MgenApp::Usage()
             "     [queue <queueSize>][broadcast {on|off}]\n"
             "     [convert <binaryLog>][debug <debugLevel>]\n"
             "     [gpskey <gpsSharedMemoryLocation>]\n"
-            "     [boost] [reuse {on|off}]\n"
-            "     [epochtimestamp]\n"
-            "     [quantizeWindow {on|off}] [txAnalytics]\n");
+             "     [boost] [reuse {on|off}]\n"
+             "     [epochtimestamp]\n"
+             "     [quantizeWindow {on|off}] [txAnalytics]\n"
+             "     [txWireRate {on|off}]\n");
 }  // end MgenApp::Usage()
 
 
@@ -927,5 +928,4 @@ bool MgenApp::ReadCmdInput(char* buffer, unsigned int& numBytes)
 
 // This macro instantiates our MgenApp instance
 PROTO_INSTANTIATE_APP(MgenApp)
-
 

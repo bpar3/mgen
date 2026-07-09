@@ -95,97 +95,20 @@ bool MgenAnalytic::TxUpdate(unsigned int     msgSize,
 {
    if (!window_valid)
    {
-        // First event for this flow, so initialize the analytic
+        // First event for this flow, so initialize the analytic and
+        // align the window to a nice boundary based on txTime.
         window_valid = true;
-        window_start = txTime;
-        window_end = window_start;
-        window_end += window_size;
-        if (0 != msgSize)
-        {
-            dup_mask.Set(seqNum);
-            seq_start = seqNum;
-            msg_count = 1;
-            byte_count = msgSize;
-        }
-        else
-        {
-            msg_count = byte_count = 0;
-            latency_sum = latency_min = latency_max = 0.0;
-        }
-        return false;
+        double t = txTime.GetValue();
+        double startVal = floor(t / window_size) * window_size;
+        window_start = ProtoTime(startVal);
+        window_end = ProtoTime(startVal + window_size);
+        msg_count = 0;
+        byte_count = 0;
+        dup_msg_count = 0;
+        latency_sum = 0.0;
     }
 
-    bool report_updated = false;
-
-    // 1st packet sent for new window - Generate report for last window and
-    // reset window indices and counts before updating metrics for current
-    if (txTime >= window_end)
-    {
-        // Update report (also build REPORT msg into buffer)
-        report_valid = true;
-        report_start = window_start;
-        // Always calculate report duration as window size
-        report_duration = window_size;
-
-        switch (msg_count)
-        {
-            // Note case 0 and case 1 here will only come into play when window timeouts are implemented
-            // At the moment, the MgenAnalytic is completely event-driven by sent messages for the flow
-            case 0:
-            {
-                report_msg_count = 0;
-                report_rate_ave = 0.0;
-                break;
-            }
-            case 1:
-            {
-                // one-shot report (only a single message for window)
-                report_msg_count = 1;
-                report_rate_ave = (double)byte_count / report_duration;
-                break;
-            }
-            default:
-            {
-                report_msg_count = msg_count;
-                report_rate_ave = (double)byte_count / report_duration;
-                break;
-            }
-        }
-
-        // Reset window indices and counts
-        window_start += window_size; // Align next window to end of previous window to prevent drift
-        window_end += window_size;
-
-        // Account for gaps > window_size where packets were not sent
-        double tx_gap = ProtoTime::Delta(window_end,txTime);
-        while (tx_gap < 0)
-        {
-            window_start += window_size;
-            window_end += window_size;
-
-            PLOG(PL_DEBUG,
-                "MgenAnalytic::TxUpdate(): Detected large gap (%f).  New window start:: %f, end: %f)\n",
-                tx_gap,
-                window_start.GetValue(),
-                window_end.GetValue()
-            );
-            tx_gap = ProtoTime::Delta(window_end,txTime);
-        }
-
-        seq_start = seqNum;  // sequence number of 1st msg (just sent) in new window
-
-        byte_count = msg_count = 0;
-
-        // Update our "report_buffer" metrics
-        // TBD - make this conditional upon an initialization variable?
-        // windowOffset not set until report is sent
-        report_msg.SetWindowSize(report_duration);
-        report_msg.SetRateAve(report_rate_ave);
-
-        report_updated = true;
-    }
-
-    // Update current analytics for current window
+    // Update current analytics for current window (accumulate only)
     if (0 != msgSize)
     {
         if (dup_mask.IsSet())
@@ -233,7 +156,9 @@ bool MgenAnalytic::TxUpdate(unsigned int     msgSize,
         }
     }
 
-    return report_updated;
+    // Window rolling and report emission are now driven by the
+    // analytic timer via FinalizeTxWindow().
+    return false;
 }  // end MgenAnalytic::TxUpdate()
 
 void MgenAnalytic::TxLog(FILE*            filePtr,
@@ -271,6 +196,66 @@ void MgenAnalytic::TxLog(FILE*            filePtr,
                 report_duration, report_rate_ave*8.0e-03, report_msg_count);
 }  // end MgenAnalytic::TxLog()
 
+void MgenAnalytic::FinalizeTxWindow()
+{
+    if (!window_valid)
+        return;
+
+    // Populate report fields for this window based on accumulated
+    // counts.  Duration is always one full window.
+    report_valid = true;
+    report_start = window_start;
+    report_duration = window_size;
+
+    switch (msg_count)
+    {
+        case 0:
+            report_msg_count = 0;
+            report_rate_ave = 0.0;
+            break;
+        default:
+            report_msg_count = msg_count;
+            report_rate_ave = (report_duration > 0.0) ?
+                              ((double)byte_count / report_duration) : 0.0;
+            break;
+    }
+
+#ifdef LINUX
+    // Optional TCP wire-rate accounting: override offered-load rate
+    // with bytes actually drained from the kernel send queue.  This
+    // is only applied when enabled and when we have a live socket.
+    if (tx_wire_rate && (NULL != tx_socket) && tx_socket->IsConnected())
+    {
+        int q = 0;
+        if (0 == ioctl(tx_socket->GetHandle(), SIOCOUTQ, &q))
+        {
+            unsigned long queue_now = (unsigned long)q;
+            unsigned long drained = (tx_written_total - tx_written_prev);
+            if (queue_now > tx_queue_prev)
+                drained -= (queue_now - tx_queue_prev);
+            else
+                drained += (tx_queue_prev - queue_now);
+            if (report_duration > 0.0)
+                report_rate_ave = (double)drained / report_duration;
+            tx_written_prev = tx_written_total;
+            tx_queue_prev = queue_now;
+        }
+    }
+#endif // LINUX
+
+    // Update the encoded report message.
+    report_msg.SetWindowSize(report_duration);
+    report_msg.SetRateAve(report_rate_ave);
+
+    // Advance window to the next interval and clear counters so the
+    // timer can continue to roll windows even during gaps.
+    window_start += window_size;
+    window_end += window_size;
+    msg_count = 0;
+    byte_count = 0;
+    dup_msg_count = 0;
+}
+
 bool MgenAnalytic::Update(const ProtoTime& rxTime,
                           unsigned int     msgSize,
                           const ProtoTime& txTime,
@@ -278,128 +263,17 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
 {
    if (!window_valid)
    {
-        // First event for this flow, so initialize the analytic
+        // First event for this flow, so initialize the analytic and
+        // align the window to a nice boundary based on rxTime.
         window_valid = true;
-        window_start = rxTime;
-        window_end = window_start;
-        window_end += window_size;
-        if (0 != msgSize)
-        {
-            dup_mask.Set(seqNum);
-            seq_start = seqNum;
-            msg_count = 1;
-            byte_count = msgSize;
-            latency_sum = latency_min = latency_max = ProtoTime::Delta(rxTime, txTime);
-        }
-        else
-        {
-            msg_count = byte_count = 0;
-            latency_sum = latency_min = latency_max = 0.0;
-        }
-        return false;  
-    }
-
-    bool report_updated = false;
-
-    // 1st packet received for new window - Generate report for last window and 
-    // Reset window indices and counts before updating metrics for current
-    if (rxTime >= window_end)
-    {
-        // Update report (also build REPORT msg into buffer)
-        report_valid = true;
-        report_start = window_start;
-        // Always calculate report duration as window size 
-        report_duration = window_size;
-        UINT32 seqMax;
-        if (!dup_mask.GetLastSet(seqMax))  // gets highest sequence number observed
-            seqMax = seq_start;
-
-        switch (msg_count)
-        {
-            // Note case 0 and case 1 here will only come into play when window timeouts are implemented
-            // At the moment, the MgenAnalytic is completely event-driven by received messages for the flow
-            case 0:
-            {
-                report_msg_count = 0;
-                report_rate_ave = 0.0;
-                report_loss_ave = 1.0;  // assume 100% loss
-                report_latency_ave = report_latency_min = report_latency_max = -1.0;
-                break;
-            }
-            case 1:
-            {
-                // one-shot report (only a single message for window)
-                report_msg_count = 1;
-                report_rate_ave = (double)byte_count / report_duration;
-                report_loss_ave = 0.0;
-                report_latency_ave = latency_sum;
-                report_latency_min = latency_min;
-                report_latency_max = latency_max;
-                break;
-            }
-            default:
-            {
-                report_msg_count = msg_count;
-                report_rate_ave = (double)byte_count / report_duration;
-                UINT32 seqDelta = seqMax - seq_start;
-                // If "seqDelta" is zero, this means _only_ a single message
-                // (or duplicate messages) has been received, so
-                // report "one-shot" goodput, latency, and zero loss
-                // TBD - provide option for reporting duplicate rx rate
-                switch (seqDelta)
-                {
-                    case 0:
-                    case 1:
-                        report_loss_ave = 0.0;
-                        break;
-                    default:
-                        report_loss_ave = 1.0 - (double)msg_count / (double)(seqDelta + 1);
-                        break;
-                }
-                report_latency_ave = latency_sum / (double)msg_count;
-                report_latency_min = latency_min;
-                report_latency_max = latency_max;
-                break;
-            }
-        }
-
-        // Reset window indices and counts
-        window_start += window_size; // Align next window to end of previous window to prevent drift
-        window_end += window_size;
-
-        // Account for gaps > window_size where packets were not received
-        double rx_gap = ProtoTime::Delta(window_end,rxTime);
-        while (rx_gap < 0)
-        {
-            window_start += window_size;
-            window_end += window_size;
-
-            PLOG(PL_DEBUG, 
-                "MgenAnalytic::Update(): Detected large gap (%f).  New window start:: %f, end: %f)\n",
-                rx_gap,
-                window_start.GetValue(),
-                window_end.GetValue()
-            );
-            rx_gap = ProtoTime::Delta(window_end,rxTime);
-        }
-
-        seq_start = seqNum;  // sequence number of 1st msg (just received) in new window
-
-        byte_count = msg_count = 0;
-        latency_sum = latency_min = latency_max = 0.0;
-
-        // Update our "report_buffer" metrics
-        // TBD - make this conditional upon an initialization variable?
-        // windowOffset not set until report is sent
-        report_msg.SetWindowSize(report_duration);
-        report_msg.SetLatencyAve(report_latency_ave);
-        // Min/Max latencies reported as relative offsets from average latency
-        report_msg.SetLatencyDeltaMin(report_latency_ave - report_latency_min);
-        report_msg.SetLatencyDeltaMax(report_latency_max - report_latency_ave);
-        report_msg.SetRateAve(report_rate_ave);
-        report_msg.SetLossFraction(report_loss_ave);
-        
-        report_updated = true;
+        double t = rxTime.GetValue();
+        double startVal = floor(t / window_size) * window_size;
+        window_start = ProtoTime(startVal);
+        window_end = ProtoTime(startVal + window_size);
+        msg_count = 0;
+        byte_count = 0;
+        dup_msg_count = 0;
+        latency_sum = 0.0;
     }
 
 
@@ -437,6 +311,10 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
                     dup_mask.UnsetBits(firstSet, numBits);
                     dup_mask.Set(seqNum);
                 }
+                // On the first new message of a (timer-rolled) window, mark the
+                // window's starting sequence number so per-window loss is
+                // computed over this window's sequence range, not since flow start.
+                if (0 == msg_count) seq_start = seqNum;
                 // Ignore size of first message (serves as time reference only)
                 // when more than one message in window
                 // if (1 == msg_count)
@@ -472,8 +350,86 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
         }
     }
 
-    return report_updated; 
+    // Window rolling and report emission are now driven by the
+    // analytic timer via FinalizeRxWindow().
+    return false; 
 }  // end MgenAnalytic::Update()
+
+void MgenAnalytic::FinalizeRxWindow()
+{
+    if (!window_valid)
+        return;
+
+    // Update report (also build REPORT msg into buffer)
+    report_valid = true;
+    report_start = window_start;
+    report_duration = window_size;
+
+    UINT32 seqMax;
+    if (!dup_mask.GetLastSet(seqMax))  // gets highest sequence number observed
+        seqMax = seq_start;
+
+    switch (msg_count)
+    {
+        case 0:
+            report_msg_count = 0;
+            report_rate_ave = 0.0;
+            report_loss_ave = 1.0;  // assume 100% loss
+            report_latency_ave = report_latency_min = report_latency_max = -1.0;
+            break;
+        case 1:
+            // one-shot report (only a single message for window)
+            report_msg_count = 1;
+            report_rate_ave = (report_duration > 0.0) ?
+                              ((double)byte_count / report_duration) : 0.0;
+            report_loss_ave = 0.0;
+            report_latency_ave = latency_sum;
+            report_latency_min = latency_min;
+            report_latency_max = latency_max;
+            break;
+        default:
+            report_msg_count = msg_count;
+            report_rate_ave = (report_duration > 0.0) ?
+                              ((double)byte_count / report_duration) : 0.0;
+            {
+                UINT32 seqDelta = seqMax - seq_start;
+                switch (seqDelta)
+                {
+                    case 0:
+                    case 1:
+                        report_loss_ave = 0.0;
+                        break;
+                    default:
+                        report_loss_ave = 1.0 - (double)msg_count / (double)(seqDelta + 1);
+                        break;
+                }
+            }
+            report_latency_ave = (msg_count > 0) ?
+                                 (latency_sum / (double)msg_count) : 0.0;
+            report_latency_min = latency_min;
+            report_latency_max = latency_max;
+            break;
+    }
+
+    // Update our "report_buffer" metrics for this window.
+    report_msg.SetWindowSize(report_duration);
+    report_msg.SetLatencyAve(report_latency_ave);
+    // Min/Max latencies reported as relative offsets from average latency
+    report_msg.SetLatencyDeltaMin(report_latency_ave - report_latency_min);
+    report_msg.SetLatencyDeltaMax(report_latency_max - report_latency_ave);
+    report_msg.SetRateAve(report_rate_ave);
+    report_msg.SetLossFraction(report_loss_ave);
+
+    // Advance window to the next interval and clear counters.
+    window_start += window_size;
+    window_end += window_size;
+    msg_count = 0;
+    byte_count = 0;
+    dup_msg_count = 0;
+    latency_sum = 0.0;
+    latency_min = 0.0;
+    latency_max = 0.0;
+}
 
 void MgenAnalytic::Log(FILE*            filePtr, 
                        const ProtoTime& sentTime, 
@@ -1002,5 +958,3 @@ void MgenAnalytic::Report::Log(FILE*                filePtr,
                 GetWindowSize(), GetRateAve()*8.0e-03, GetLossFraction(), 
                 GetLatencyAve(), GetLatencyMin(), GetLatencyMax());
 }  // end MgenAnalytic::Report::Log()
-
-

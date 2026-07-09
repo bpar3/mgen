@@ -6,10 +6,11 @@
 #include "protoString.h"  // for ProtoTokenator
 
 #include <string.h>
-#include <stdio.h>   
+#include <stdio.h>
 #include <time.h>       // for gmtimeon()
 #include <errno.h>      // for errno
 #include <ctype.h>      // for toupper(
+#include <math.h>       // for floor()/fmod() (analytic window alignment)
 #ifdef UNIX
 #include <sys/types.h>  // for stat
 #include <sys/stat.h>   // for stat
@@ -113,6 +114,7 @@ Mgen::Mgen(ProtoTimerMgr&         timerMgr,
   addr_type(ProtoAddress::IPv4), 
   analytic_window(MgenAnalytic::DEFAULT_WINDOW),
   tx_analytics(false), compute_analytics(false), report_analytics(false), window_quantize(true),
+  tx_wire_rate(false),
   get_position(NULL), get_position_data(NULL),
   log_file(NULL), log_binary(false), local_time(false), log_flush(false), 
   log_file_lock(false), log_tx(false), log_rx(true), log_open(false), log_empty(true),
@@ -127,6 +129,13 @@ Mgen::Mgen(ProtoTimerMgr&         timerMgr,
     drec_event_timer.SetInterval(0.0);
     drec_event_timer.SetRepeat(-1);
 
+    // Periodic analytic reporting timer.  Interval/phase are set when it is
+    // activated (aligned to the next whole window_size boundary) and the
+    // callback re-arms it each fire (one-shot repeat) to stay phase-locked.
+    analytic_timer.SetListener(this, &Mgen::OnAnalyticTimeout);
+    analytic_timer.SetInterval(analytic_window);
+    analytic_timer.SetRepeat(-1);  // periodic; interval re-adjusted each fire
+
     default_interface[0] = '\0';
     sink_path[0] = '\0';
     source_path[0] = '\0';
@@ -136,6 +145,7 @@ Mgen::~Mgen()
 {
     Stop();
     analytic_table.Destroy();
+    tx_analytic_table.Destroy();
     if (save_path) delete save_path;
 }
 
@@ -640,6 +650,7 @@ void Mgen::Stop()
     if (start_timer.IsActive()) start_timer.Deactivate();
     flow_list.Destroy();
     if (drec_event_timer.IsActive()) drec_event_timer.Deactivate();
+    if (analytic_timer.IsActive()) analytic_timer.Deactivate();
     drec_event_list.Destroy();
     drec_group_list.Destroy(*this);
     transport_list.Destroy();
@@ -1023,12 +1034,27 @@ void Mgen::RemoveAnalytic(Protocol                protocol,
     delete analytic;
 }  // end Mgen::RemoveAnalytic()
 
+void Mgen::RemoveTxAnalytic(Protocol                protocol,
+                            const ProtoAddress&     srcAddr,
+                            const ProtoAddress&     dstAddr,
+                            UINT32                  flowId)
+{
+    // TX analytics are log-only (not fed back into flow reporters), so we
+    // simply remove the entry from the TX table.
+    MgenAnalytic* analytic = tx_analytic_table.FindFlow(srcAddr, dstAddr, flowId);
+    if (NULL == analytic) return;
+    tx_analytic_table.Remove(*analytic);
+    delete analytic;
+}  // end Mgen::RemoveTxAnalytic()
 
-void Mgen::UpdateSendAnalytics(const struct timeval& tx_time, unsigned int msg_len, MgenMsg* theMsg)
+
+void Mgen::UpdateSendAnalytics(const struct timeval& tx_time, unsigned int msg_len, MgenMsg* theMsg, ProtoSocket* txSocket)
 {
     if (!tx_analytics) return;
     if (NULL == theMsg) return;
-    MgenAnalytic* analytic = analytic_table.FindFlow(theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId());
+    // TX analytics live in their own table so they never collide with RX
+    // analytics for the same (src,dst,flowId) tuple (e.g., loopback tests).
+    MgenAnalytic* analytic = tx_analytic_table.FindFlow(theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId());
     if (NULL == analytic)
     {
         if (NULL == (analytic = new MgenAnalytic()))
@@ -1039,27 +1065,39 @@ void Mgen::UpdateSendAnalytics(const struct timeval& tx_time, unsigned int msg_l
         if (!analytic->Init(theMsg->GetProtocol(), theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId(), window_quantize, analytic_window))
         {
             PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() MgenAnalytic() initialization error: %s\n", GetErrorString());
+            delete analytic;
             return;
         }
-        if (!analytic_table.Insert(*analytic))
+        if (!tx_analytic_table.Insert(*analytic))
         {
             PLOG(PL_ERROR, "Mgen::UpdateSendAnalytics() unable to add new flow analytic: %s\n", GetErrorString());
             delete analytic;
             return;
         }
+        analytic->SetTxSocket(txSocket);
+        analytic->SetTxWireRate(tx_wire_rate);
+        // SIOCOUTQ is per-socket; if multiple flows share this socket, wire-rate
+        // accounting cannot be attributed per-flow, so disable it for them.
+        if (tx_wire_rate && (NULL != txSocket))
+            HandleTxWireRateSocketSharing(txSocket, analytic);
+    }
+    else
+    {
+        // The socket can change across TCP reconnects; keep the pointer current.
+        analytic->SetTxSocket(txSocket);
     }
 
-    if (analytic->TxUpdate(msg_len, ProtoTime(tx_time), theMsg->GetSeqNum()))
-    {
-        analytic->TxLog(log_file, ProtoTime(theMsg->GetTxTime()), local_time);
-    }
+    // Count bytes handed to the socket (for wire-rate drain accounting) and
+    // accumulate into the current window.  The periodic analytic timer emits
+    // the TXREPORT for each elapsed window via FinalizeTxWindow()/TxLog().
+    analytic->AddTxWrittenBytes(msg_len);
+    analytic->TxUpdate(msg_len, ProtoTime(tx_time), theMsg->GetSeqNum());
+
+    ActivateAnalyticTimer();
 }  // end Mgen::UpdateSendAnalytics()
 
 void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protocol theProtocol)
 {
-    // This is a work in progress.  Eventually an option to report back measured
-    // analytics in the MGEN payload will use this code. The printout to STDERR
-    // here is just a temporary "feature" 
     if (!compute_analytics) return;
     if (NULL == theMsg) return; // TBD - support timeout driven update
     MgenAnalytic* analytic = analytic_table.FindFlow(theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId());
@@ -1073,6 +1111,7 @@ void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protoc
         if (!analytic->Init(theProtocol, theMsg->GetSrcAddr(), theMsg->GetDstAddr(), theMsg->GetFlowId(), window_quantize, analytic_window))
         {
             PLOG(PL_ERROR, "Mgen::UpdateRecvAnalytics() MgenAnalytic() initialization error: %s\n", GetErrorString());
+            delete analytic;
             return;
         }
         if (!analytic_table.Insert(*analytic))
@@ -1082,23 +1121,112 @@ void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protoc
             return;
         }
     }
-    
-    if (analytic->Update(theTime, theMsg->GetMsgLen(), ProtoTime(theMsg->GetTxTime()), theMsg->GetSeqNum()))
-    {
-        MgenFlow* nextFlow = flow_list.Head();
-        while (NULL != nextFlow)
-        {
-            if (nextFlow->GetReportAnalytics())
-                nextFlow->UpdateAnalyticReport(*analytic);
-            nextFlow = flow_list.GetNext(nextFlow);
-        }       
-        const MgenAnalytic::Report& report = analytic->GetReport(theTime);
-        if (NULL != controller)  // e.g., Mgendr GUI
-            controller->OnUpdateReport(theTime, report);
-        analytic->Log(log_file, theTime, theTime, local_time);
-    }
-    
+
+    // Accumulate into the current window.  The periodic analytic timer emits
+    // the REPORT (and queues analytic feedback / GUI updates) for each elapsed
+    // window via FinalizeRxWindow().
+    analytic->Update(theTime, theMsg->GetMsgLen(), ProtoTime(theMsg->GetTxTime()), theMsg->GetSeqNum());
+
+    ActivateAnalyticTimer();
 }  // end Mgen::UpdateRecvAnalytics()
+
+void Mgen::ActivateAnalyticTimer()
+{
+    if ((tx_analytics || compute_analytics) && !analytic_timer.IsActive())
+    {
+        // Fire just after the next whole-window_size boundary so reports
+        // (timestamped at window_end) land on "nice" boundaries.
+        ProtoTime now;
+        now.GetCurrentTime();
+        double toBoundary = analytic_window - fmod(now.GetValue(), analytic_window);
+        if (toBoundary <= 0.0) toBoundary = analytic_window;
+        analytic_timer.SetInterval(toBoundary);
+        timer_mgr.ActivateTimer(analytic_timer);
+    }
+}  // end Mgen::ActivateAnalyticTimer()
+
+bool Mgen::OnAnalyticTimeout(ProtoTimer& theTimer)
+{
+    ProtoTime now;
+    now.GetCurrentTime();
+
+    // TX: emit a TXREPORT (timestamped at window_end) for every elapsed window,
+    // including empty ones (zero rate) so the cadence is steady with no gaps.
+    MgenAnalyticTable::Iterator txIterator(tx_analytic_table);
+    MgenAnalytic* analytic;
+    while (NULL != (analytic = txIterator.GetNextItem()))
+    {
+        while (analytic->WindowElapsed(now))
+        {
+            ProtoTime windowEnd = analytic->GetWindowEnd();
+            analytic->FinalizeTxWindow();
+            analytic->TxLog(log_file, windowEnd, local_time);
+        }
+    }
+
+    // RX: emit a REPORT (timestamped at window_end) for every elapsed window and
+    // queue analytic feedback / GUI updates, mirroring the former event path.
+    MgenAnalyticTable::Iterator rxIterator(analytic_table);
+    while (NULL != (analytic = rxIterator.GetNextItem()))
+    {
+        while (analytic->WindowElapsed(now))
+        {
+            ProtoTime windowEnd = analytic->GetWindowEnd();
+            analytic->FinalizeRxWindow();
+            MgenFlow* nextFlow = flow_list.Head();
+            while (NULL != nextFlow)
+            {
+                if (nextFlow->GetReportAnalytics())
+                    nextFlow->UpdateAnalyticReport(*analytic);
+                nextFlow = flow_list.GetNext(nextFlow);
+            }
+            const MgenAnalytic::Report& report = analytic->GetReport(windowEnd);
+            if (NULL != controller)  // e.g., Mgendr GUI
+                controller->OnUpdateReport(windowEnd, report);
+            analytic->Log(log_file, windowEnd, windowEnd, local_time);
+        }
+    }
+
+    // Re-arm aligned to the next window boundary (self-correcting phase lock).
+    double toBoundary = analytic_window - fmod(now.GetValue(), analytic_window);
+    if (toBoundary < (analytic_window * 0.01)) toBoundary += analytic_window;
+    theTimer.SetInterval(toBoundary);
+    return true;  // periodic repeat reschedules with the updated interval
+}  // end Mgen::OnAnalyticTimeout()
+
+void Mgen::HandleTxWireRateSocketSharing(ProtoSocket* socket, MgenAnalytic* newAnalytic)
+{
+    if (NULL == socket) return;
+    unsigned int count = 0;
+    MgenAnalyticTable::Iterator it(tx_analytic_table);
+    MgenAnalytic* a = NULL;
+    while (NULL != (a = it.GetNextItem()))
+    {
+        if (a == newAnalytic) continue;
+        if (a->GetTxSocket() == socket)
+        {
+            count++;
+            a->SetTxWireRate(false);
+        }
+    }
+    if (count > 0)
+    {
+        newAnalytic->SetTxWireRate(false);
+        PLOG(PL_WARN, "Mgen::UpdateSendAnalytics() txWireRate enabled, but multiple flows share the same socket; reverting to offered-load accounting for those flows.\n");
+    }
+}  // end Mgen::HandleTxWireRateSocketSharing()
+
+void Mgen::ClearTxAnalyticSocket(ProtoSocket* socket)
+{
+    if (NULL == socket) return;
+    MgenAnalyticTable::Iterator it(tx_analytic_table);
+    MgenAnalytic* a = NULL;
+    while (NULL != (a = it.GetNextItem()))
+    {
+        if (a->GetTxSocket() == socket)
+            a->ClearTxSocket();
+    }
+}  // end Mgen::ClearTxAnalyticSocket()
 
 
 /**
@@ -1484,6 +1612,7 @@ const StringMapper Mgen::COMMAND_LIST[] =
     {"+RECONNECT",  RECONNECT},
     {"-EPOCHTIMESTAMP", EPOCH_TIMESTAMP},
     {"+QUANTIZEWINDOW", WINDOW_QUANTIZE},
+    {"+TXWIRERATE", TX_WIRE_RATE},
     {"+OFF",        INVALID_COMMAND},  // to deconflict "offset" from "off" event
     {NULL,          INVALID_COMMAND}   
 };
@@ -1568,12 +1697,21 @@ void Mgen::SetAnalyticWindow(double windowSize)
     if (windowSize <= 0.0) return;
     UINT8 q = MgenAnalytic::Report::QuantizeTimeValue(windowSize);
     analytic_window = MgenAnalytic::Report::UnquantizeTimeValue(q);
-    // Update existing averaging windows
+    // Update existing averaging windows (both RX and TX tables)
     MgenAnalyticTable::Iterator iterator(analytic_table);
     MgenAnalytic* next;
     while (NULL != (next = iterator.GetNextItem()))
         next->SetWindowSize(windowSize);
+    MgenAnalyticTable::Iterator txIterator(tx_analytic_table);
+    while (NULL != (next = txIterator.GetNextItem()))
+        next->SetWindowSize(windowSize);
 }  // end Mgen::SetAnalyticWindow()
+
+void Mgen::SetTxAnalyticWindow(double windowSize)
+{
+    // TX and RX analytics share a single window size; delegate.
+    SetAnalyticWindow(windowSize);
+}  // end Mgen::SetTxAnalyticWindow()
 
 bool Mgen::OnCommand(Mgen::Command cmd, const char* arg, bool override)
 { 
@@ -2194,6 +2332,44 @@ bool Mgen::OnCommand(Mgen::Command cmd, const char* arg, bool override)
           return false;
       }
       SetWindowQuantize(windowQuantizeTmp);
+      break;
+    }
+    case TX_WIRE_RATE:
+    {
+      if (!arg)
+      {
+          DMSG(0, "Mgen::OnCommand() Error: missing argument to txWireRate\n");
+          return false;
+      }
+      bool txWireRateTmp;
+      // convert to upper case for case-insensitivity
+      char temp[5];
+      size_t len = strlen(arg);
+      len = len < 4 ? len : 4;
+      unsigned int i;
+      for (i = 0 ; i < len; i++)
+        temp[i] = toupper(arg[i]);
+      temp[i] = '\0';
+      if(!strncmp("ON", temp, len))
+          txWireRateTmp = true;
+      else if(!strncmp("OFF", temp, len))
+          txWireRateTmp = false;
+      else
+      {
+          DMSG(0, "Mgen::OnCommand() Error: wrong argument to txWireRate: %s\n", arg);
+          return false;
+      }
+#ifndef LINUX
+      // Wire-rate accounting relies on the Linux SIOCOUTQ ioctl.  On other
+      // platforms, warn and revert to offered-load (bursty) TXREPORT rates.
+      if (txWireRateTmp)
+      {
+          PLOG(PL_WARN, "Mgen::OnCommand() txWireRate unsupported on this platform "
+                        "(no SIOCOUTQ); ignoring - TCP TXREPORT will use offered-load accounting\n");
+          txWireRateTmp = false;
+      }
+#endif // !LINUX
+      SetTxWireRate(txWireRateTmp);
       break;
     }
     case INVALID_COMMAND:
