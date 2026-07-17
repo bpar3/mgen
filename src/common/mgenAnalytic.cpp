@@ -230,11 +230,9 @@ void MgenAnalytic::FinalizeTxWindow()
         if (0 == ioctl(tx_socket->GetHandle(), SIOCOUTQ, &q))
         {
             unsigned long queue_now = (unsigned long)q;
-            unsigned long drained = (tx_written_total - tx_written_prev);
-            if (queue_now > tx_queue_prev)
-                drained -= (queue_now - tx_queue_prev);
-            else
-                drained += (tx_queue_prev - queue_now);
+            long queue_delta = (long)queue_now - (long)tx_queue_prev;
+            unsigned long drained =
+                ComputeDrainedBytes(tx_written_total - tx_written_prev, queue_delta);
             if (report_duration > 0.0)
                 report_rate_ave = (double)drained / report_duration;
             tx_written_prev = tx_written_total;

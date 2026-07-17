@@ -91,10 +91,21 @@ MM_SRC = $(COMMON)/mgenBlast.cpp
 MM_OBJ = $(MM_SRC:.cpp=.o)
 
 mgenBlast:	$(MM_OBJ) $(MGEN_OBJ) $(LIBPROTO)
-		$(CC) -g $(CFLAGS) -o $@ $(MM_OBJ) $(MGEN_OBJ) $(LDFLAGS) $(LIBPROTO) $(LIBS) 
-     	    
-clean:	
-	rm -f $(COMMON)/*.o  $(UNIX)/*.o $(UNIX)/mgen $(UNIX)/*.so $(UNIX)/mpmgr $(NS)/*.o;
+		$(CC) -g $(CFLAGS) -o $@ $(MM_OBJ) $(MGEN_OBJ) $(LDFLAGS) $(LIBPROTO) $(LIBS)
+
+# mgenAnalyticTest is a standalone unit-test driver for MgenAnalytic
+ANALYTIC_TEST_SRC = $(COMMON)/mgenAnalyticTest.cpp
+ANALYTIC_TEST_OBJ = $(ANALYTIC_TEST_SRC:.cpp=.o)
+
+mgenAnalyticTest:	$(ANALYTIC_TEST_OBJ) $(MGEN_OBJ) $(LIBPROTO)
+		$(CC) -g $(CFLAGS) -o $@ $(ANALYTIC_TEST_OBJ) $(MGEN_OBJ) $(LDFLAGS) $(LIBPROTO) $(LIBS)
+
+# Build and run the unit tests
+check:	mgenAnalyticTest
+		./mgenAnalyticTest
+
+clean:
+	rm -f $(COMMON)/*.o  $(UNIX)/*.o $(UNIX)/mgen $(UNIX)/*.so $(UNIX)/mpmgr $(UNIX)/mgenAnalyticTest $(NS)/*.o;
 	$(MAKE) -C $(PROTOLIB)/makefiles -f Makefile.$(SYSTEM) clean
 distclean:  clean
 

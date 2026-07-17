@@ -2,6 +2,7 @@
 makefiles/mgen
 makefiles/mpmgr
 makefiles/pcap2mgen
+makefiles/mgenAnalyticTest
 
 # python generated files
 build

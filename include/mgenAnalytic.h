@@ -146,6 +146,17 @@ class MgenAnalytic : public ProtoQueue::Item
         void AddTxWrittenBytes(unsigned long byteCount)
             {tx_written_total += byteCount;}
 
+        // Bytes drained onto the wire during a window = bytes newly written
+        // into the send buffer minus the change in send-queue occupancy
+        // (queueDelta = queueNow - queuePrev).  Clamped at zero.  Exposed as a
+        // static pure function so the wire-rate arithmetic is unit-testable.
+        static unsigned long ComputeDrainedBytes(unsigned long writtenDelta,
+                                                 long          queueDelta)
+        {
+            long drained = (long)writtenDelta - queueDelta;
+            return (drained > 0) ? (unsigned long)drained : 0;
+        }
+
         const Report& GetReport(const ProtoTime& theTime);
         const ProtoTime& GetReportTime() const
             {return report_time;}
