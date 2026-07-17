@@ -100,9 +100,17 @@ ANALYTIC_TEST_OBJ = $(ANALYTIC_TEST_SRC:.cpp=.o)
 mgenAnalyticTest:	$(ANALYTIC_TEST_OBJ) $(MGEN_OBJ) $(LIBPROTO)
 		$(CC) -g $(CFLAGS) -o $@ $(ANALYTIC_TEST_OBJ) $(MGEN_OBJ) $(LDFLAGS) $(LIBPROTO) $(LIBS)
 
-# Build and run the unit tests
+# Build and run the C++ unit tests
 check:	mgenAnalyticTest
 		./mgenAnalyticTest
+
+# Build mgen and run the Python end-to-end analytics tests (needs python3)
+PYTHON3 ?= python3
+check-e2e:	mgen
+		$(PYTHON3) $(PYTHON)/mgenAnalyticsTest.py --mgen ./mgen
+
+# Run both the unit and end-to-end test suites
+check-all:	check check-e2e
 
 clean:
 	rm -f $(COMMON)/*.o  $(UNIX)/*.o $(UNIX)/mgen $(UNIX)/*.so $(UNIX)/mpmgr $(UNIX)/mgenAnalyticTest $(NS)/*.o;
