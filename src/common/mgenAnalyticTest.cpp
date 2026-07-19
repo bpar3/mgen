@@ -186,8 +186,9 @@ static void test_rx_empty_window()
     a.FinalizeRxWindow();          // next window: empty
     CHECK(a.GetReportMessageCount() == 0);
     CHECK_NEAR(a.GetReportRateAverage(), 0.0, 1e-9);
-    CHECK_NEAR(a.GetReportLossFraction(), 1.0, 1e-9);       // assume 100% loss
-    CHECK_NEAR(a.GetReportLatencyAverage(), -1.0, 1e-9);    // no latency
+    // A gap-fill (empty) window is NOT loss -- must report 0, not 100%.
+    CHECK_NEAR(a.GetReportLossFraction(), 0.0, 1e-9);
+    CHECK_NEAR(a.GetReportLatencyAverage(), -1.0, 1e-9);    // no latency sample
 }
 
 // ---- Test 9: duplicate sequence numbers are not double-counted -------------

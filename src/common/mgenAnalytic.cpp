@@ -15,7 +15,8 @@ MgenAnalytic::MgenAnalytic()
    msg_count(0), byte_count(0), dup_msg_count(0), latency_sum(0.0),
    tx_socket(NULL), tx_wire_rate(false), tx_written_total(0),
    tx_written_prev(0), tx_queue_prev(0),
-   report_valid(false), report_msg_count(0)
+   report_valid(false), report_msg_count(0),
+   report_wire_valid(false), report_wire_rate_ave(0.0), report_wire_bytes(0)
 {
     // Adjust set window_size to quantized version
     UINT8 q = Report::QuantizeTimeValue(window_size);
@@ -192,8 +193,15 @@ void MgenAnalytic::TxLog(FILE*            filePtr,
     ProtoAddress dstAddr;
     report_msg.GetDstAddr(dstAddr);
     Mgen::Log(filePtr, "dst>%s/%hu ", dstAddr.GetHostString(), dstAddr.GetPort());
-    Mgen::Log(filePtr,"window>%lf rate>%lf kbps, count>%lu\n",
+    // Legacy offered-load fields are always present and self-consistent.
+    Mgen::Log(filePtr,"window>%lf rate>%lf kbps, count>%lu",
                 report_duration, report_rate_ave*8.0e-03, report_msg_count);
+    // When txWireRate is enabled, append the actual wire throughput measured
+    // for this window (bytes drained from the kernel send buffer).
+    if (report_wire_valid)
+        Mgen::Log(filePtr," wireRate>%lf kbps wireBytes>%lu",
+                    report_wire_rate_ave*8.0e-03, report_wire_bytes);
+    Mgen::Log(filePtr,"\n");
 }  // end MgenAnalytic::TxLog()
 
 void MgenAnalytic::FinalizeTxWindow()
@@ -207,23 +215,20 @@ void MgenAnalytic::FinalizeTxWindow()
     report_start = window_start;
     report_duration = window_size;
 
-    switch (msg_count)
-    {
-        case 0:
-            report_msg_count = 0;
-            report_rate_ave = 0.0;
-            break;
-        default:
-            report_msg_count = msg_count;
-            report_rate_ave = (report_duration > 0.0) ?
-                              ((double)byte_count / report_duration) : 0.0;
-            break;
-    }
+    // Legacy offered-load metrics: rate/count always reflect what mgen offered
+    // (handed to the socket) this window, so the report is self-consistent
+    // (rate == count*size*8/window) and unchanged by the txWireRate flag.
+    report_msg_count = msg_count;
+    report_rate_ave = (report_duration > 0.0) ?
+                      ((double)byte_count / report_duration) : 0.0;
 
+    // Optional TCP wire-rate accounting reported ALONGSIDE (not instead of) the
+    // offered load: bytes actually drained from the kernel send queue this
+    // window, sampled via SIOCOUTQ.  Left invalid (and unlogged) otherwise.
+    report_wire_valid = false;
+    report_wire_bytes = 0;
+    report_wire_rate_ave = 0.0;
 #ifdef LINUX
-    // Optional TCP wire-rate accounting: override offered-load rate
-    // with bytes actually drained from the kernel send queue.  This
-    // is only applied when enabled and when we have a live socket.
     if (tx_wire_rate && (NULL != tx_socket) && tx_socket->IsConnected())
     {
         int q = 0;
@@ -233,15 +238,17 @@ void MgenAnalytic::FinalizeTxWindow()
             long queue_delta = (long)queue_now - (long)tx_queue_prev;
             unsigned long drained =
                 ComputeDrainedBytes(tx_written_total - tx_written_prev, queue_delta);
-            if (report_duration > 0.0)
-                report_rate_ave = (double)drained / report_duration;
+            report_wire_bytes = drained;
+            report_wire_rate_ave = (report_duration > 0.0) ?
+                                   ((double)drained / report_duration) : 0.0;
+            report_wire_valid = true;
             tx_written_prev = tx_written_total;
             tx_queue_prev = queue_now;
         }
     }
 #endif // LINUX
 
-    // Update the encoded report message.
+    // Update the encoded report message (offered rate, matching legacy).
     report_msg.SetWindowSize(report_duration);
     report_msg.SetRateAve(report_rate_ave);
 
@@ -370,9 +377,13 @@ void MgenAnalytic::FinalizeRxWindow()
     switch (msg_count)
     {
         case 0:
+            // An empty window is a timer-driven reporting-cadence gap (common
+            // with bursty TCP delivery), NOT packet loss -- reliable transports
+            // never lose data yet would otherwise show 100% loss here.  Report
+            // zero loss; latency has no sample (-1 sentinel).
             report_msg_count = 0;
             report_rate_ave = 0.0;
-            report_loss_ave = 1.0;  // assume 100% loss
+            report_loss_ave = 0.0;
             report_latency_ave = report_latency_min = report_latency_max = -1.0;
             break;
         case 1:

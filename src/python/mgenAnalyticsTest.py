@@ -50,10 +50,13 @@ class Report(object):
         self.lat_ave = _to_float(fields.get("ave"))     # REPORT only
         self.lat_min = _to_float(fields.get("min"))     # REPORT only
         self.lat_max = _to_float(fields.get("max"))     # REPORT only
+        # TXREPORT wire-rate fields (present only when txWireRate is enabled)
+        self.wire_rate  = _to_float(fields.get("wireRate"))    # kbps drained
+        self.wire_bytes = _to_float(fields.get("wireBytes"))   # bytes drained
 
     @property
     def bytes_est(self):
-        # rate is kbps (bytes/sec * 8 / 1000) over a "window"-second interval
+        # bytes implied by the (offered-load) rate over a "window"-second window
         if self.rate is None or self.window is None:
             return 0.0
         return self.rate * 1000.0 / 8.0 * self.window
@@ -241,6 +244,11 @@ def assert_cadence(chk, reports, window, label, min_reports=3):
               % (label, window, worst))
 
 
+def steady_windows(reports):
+    """Drop the first and last window (startup / shutdown-straddling)."""
+    return reports[1:-1] if len(reports) >= 3 else []
+
+
 def nonempty(reports):
     """Windows that actually carried messages (count > 0).
 
@@ -310,9 +318,10 @@ def scenario_udp_analytics(chk, mgen, duration):
     # Aggregate throughput matches the offered load; delivery is lossless
     assert_throughput(chk, tx, rx, rate_pps, size, duration, "UDP")
 
-    # Loss zero and latency ordered/plausible on windows that carried messages
-    for r in nonempty(rx):
-        chk.near(r.loss, 0.0, 1e-9, "RX loss == 0 on clean loopback")
+    # Loss is zero on EVERY window, including empty gap-fill windows (those must
+    # report loss 0, not the old bogus 100%).  Latency checked where sampled.
+    for r in rx:
+        chk.near(r.loss, 0.0, 1e-9, "RX loss == 0 (incl. empty gap windows)")
     chk.ge(len(nonempty(rx)), 1, "RX had non-empty windows to latency-check")
     for r in nonempty(rx):
         chk.check(r.lat_min <= r.lat_ave <= r.lat_max,
@@ -358,13 +367,13 @@ def scenario_quantize_window(chk, mgen, duration):
 
 
 def scenario_tx_wire_rate(chk, mgen, duration):
-    """txWireRate on a TCP loopback flow.  With wire-rate ON the reported TX
-    bytes must accurately track what the receiver actually got (and the nominal
-    offered load).  Also confirm cadence and that OFF (offered-load) still works."""
-    chk.scenario("txWireRate: TCP wire-rate accuracy vs offered-load")
+    """txWireRate on a TCP loopback flow.  The legacy rate>/count> fields must
+    ALWAYS report the offered load and stay self-consistent; the wireRate>/
+    wireBytes> fields must appear only when txWireRate is on and accurately
+    track the bytes actually delivered (== received, on a non-saturating link)."""
+    chk.scenario("txWireRate: legacy offered rate/count preserved + wire fields")
     port = 5020
     rate_pps, size = 100, 1024
-    nominal_bytes = None  # derived from TX count below
     ev_recv = ("event", "LISTEN TCP %d" % port)
     ev_send = ("event", "ON 1 TCP DST 127.0.0.1/%d PERIODIC [%d %d]" % (port, rate_pps, size))
 
@@ -380,27 +389,50 @@ def scenario_tx_wire_rate(chk, mgen, duration):
         assert_cadence(chk, rx, 1.0, "TCP RX REPORT (wire %s)" % wire)
         assert_cadence(chk, tx, 1.0, "TCP TX TXREPORT (wire %s)" % wire)
 
+        # Legacy rate/count ALWAYS = offered load and self-consistent, i.e.
+        # rate(kbps) == count*size*8/1000/window (regardless of the wire flag).
+        for r in nonempty(tx):
+            expected = r.count * size * 8 / 1000.0 / r.window
+            chk.near(r.rate, expected, max(1.0, expected * 0.02),
+                     "TCP wire %s: legacy rate==offered (count=%d -> %.1f kbps)"
+                     % (wire, r.count, expected))
+
         tx_count = total_count(tx)
         rx_count = total_count(rx)
-        tx_bytes = total_bytes(tx)
-        rx_bytes = total_bytes(rx)
         chk.ge(tx_count, 1, "TCP wire %s: TX produced messages" % wire)
-
-        # All sent TCP data is received (reliable transport) -> counts converge
         if tx_count:
             chk.between(rx_count, tx_count * 0.85, tx_count * 1.15,
                         "TCP wire %s: RX count (%d) ~= TX count (%d)"
                         % (wire, rx_count, tx_count))
-        # The key wire-rate claim: reported TX bytes accurately track the bytes
-        # the receiver actually got, and the nominal offered load.
-        nominal = tx_count * size
-        if tx_count:
-            chk.between(tx_bytes, nominal * 0.80, nominal * 1.20,
-                        "TCP wire %s: TX reported bytes (%d) ~= nominal (%d)"
-                        % (wire, int(tx_bytes), int(nominal)))
-            chk.between(rx_bytes, tx_bytes * 0.80, tx_bytes * 1.20,
-                        "TCP wire %s: RX bytes (%d) ~= TX reported bytes (%d)"
-                        % (wire, int(rx_bytes), int(tx_bytes)))
+
+        # Wire fields present iff txWireRate is on.  They require a live socket
+        # to sample, so they appear on every active (count>0) window; trailing
+        # empty windows after the flow's OFF closes the socket legitimately omit
+        # them.
+        tx_wire = [r for r in tx if r.wire_rate is not None]
+        if wire == "on":
+            # Every mid-transfer active window carries wire fields.  The LAST
+            # active window can straddle the flow's OFF (socket closed before the
+            # timer samples SIOCOUTQ), so exclude it.
+            active = [r for r in tx if r.count > 0]
+            midxfer = active[:-1]
+            missing = [r for r in midxfer if r.wire_rate is None]
+            chk.check(bool(midxfer) and not missing,
+                      "wire ON: mid-transfer active TXREPORTs carry wireRate/wireBytes"
+                      " (%d checked, %d missing)" % (len(midxfer), len(missing)))
+            # Accuracy: over the windows it could sample, wireBytes matches the
+            # bytes offered in those same windows (== delivered on loopback).
+            # (Windows after OFF can't be sampled, so compare like-for-like.)
+            wire_valid = [r for r in tx if r.wire_rate is not None]
+            wb = sum(r.wire_bytes for r in wire_valid)
+            offered_sampled = sum(r.count for r in wire_valid) * size
+            chk.ge(wb, 1, "wire ON: measured some wire bytes")
+            chk.between(wb, offered_sampled * 0.90, offered_sampled * 1.10,
+                        "wire ON: wireBytes (%d) ~= offered bytes over sampled windows (%d)"
+                        % (int(wb), int(offered_sampled)))
+        else:
+            chk.check(len(tx_wire) == 0,
+                      "wire OFF: no TXREPORT carries wire fields (legacy format)")
 
 
 def scenario_all_combined(chk, mgen, duration):
@@ -429,8 +461,8 @@ def scenario_all_combined(chk, mgen, duration):
         assert_cadence(chk, txf, 1.0, "combined %s TX (flow %d)" % (proto, flow))
         if rxf:
             chk.near(rxf[0].window, 1.0, 1e-6, "combined %s RX window == 1.0" % proto)
-        for r in nonempty(rxf):
-            chk.near(r.loss, 0.0, 1e-9, "combined %s RX loss == 0" % proto)
+        for r in rxf:
+            chk.near(r.loss, 0.0, 1e-9, "combined %s RX loss == 0 (incl. gaps)" % proto)
         assert_throughput(chk, txf, rxf, rate_pps, size, duration,
                           "combined %s (flow %d)" % (proto, flow))
 

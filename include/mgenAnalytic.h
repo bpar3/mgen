@@ -442,6 +442,13 @@ class MgenAnalytic : public ProtoQueue::Item
         double              report_latency_ave;
         double              report_latency_min;
         double              report_latency_max;
+        // Optional TX wire-rate results (only valid/logged when txWireRate is
+        // enabled and the send-queue could be sampled).  These are REPORTED
+        // ALONGSIDE the legacy offered-load report_rate_ave/report_msg_count,
+        // never in place of them.
+        bool                report_wire_valid;
+        double              report_wire_rate_ave;  // bytes/sec drained onto the wire
+        unsigned long       report_wire_bytes;     // bytes drained this window
         ProtoTime           report_time;
         UINT32              report_buffer[Report::MAX_LENGTH/sizeof(UINT32)];
         Report              report_msg;
