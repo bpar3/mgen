@@ -134,7 +134,7 @@
      [report] [suspend &lt;flowId(s)&gt;] [resume &lt;flowId(s)&gt;] [reset &lt;flowId(s)&gt;]
      [retry &lt;count&gt;[/&lt;delay&gt;]
      [epochtimestamp]
-     [quantizeWindow {on|off}][txAnalytics]
+     [quantizeWindow {on|off}][txAnalytics][txWireRate {on|off}]
 
 </programlisting>
 
@@ -761,6 +761,38 @@
 
             <entry>Enables analytic reporting in all transmitting
             flows.<para>See <link linkend="_REPORT">report</link> for more
+            detailed information.</para></entry>
+          </row>
+
+          <row>
+            <entry><literal>txAnalytics</literal></entry>
+
+            <entry>Enables built-in, per-flow analysis of
+            <emphasis>transmitted</emphasis> flows and outputs "<link
+            linkend="_TXANALYTICS">TXREPORT</link>" events to the mgen log file
+            (the transmit-side analogue of <link
+            linkend="_ANALYTICS">analytics</link>).<para>See <link
+            linkend="_TXANALYTICS">txAnalytics</link> for more detailed
+            information.</para></entry>
+          </row>
+
+          <row>
+            <entry><literal>txWireRate {on|off}</literal></entry>
+
+            <entry>When enabled, TCP <link
+            linkend="_TXANALYTICS">TXREPORT</link> events additionally report the
+            actual bytes drained onto the network ("wireRate"/"wireBytes"), in
+            addition to the offered load.<para>See <link
+            linkend="_TXWIRERATE">txWireRate</link> for more detailed
+            information.</para></entry>
+          </row>
+
+          <row>
+            <entry><literal>quantizeWindow {on|off}</literal></entry>
+
+            <entry>Controls whether the analytics measurement window size is
+            quantized to MGEN's compact time encoding (default on).<para>See
+            <link linkend="_QUANTIZEWINDOW">quantizeWindow</link> for more
             detailed information.</para></entry>
           </row>
 
@@ -3286,6 +3318,118 @@ mgen: starting now ...
       reporting potentially on many received flows in a single transmitted
       MGEN message. See the flow <link linkend="_FLOW_REPORT">REPORT</link>
       option for more detailed information on this capability.</para>
+    </sect2>
+
+    <sect2 id="_TXANALYTICS">
+      <title id="_TXANALYTICS">TXANALYTICS</title>
+
+      <para>Script syntax:<literal/></para>
+
+      <para><literal>TXANALYTICS</literal></para>
+
+      <para>Enables built-in, per-flow analysis of
+      <emphasis>transmitted</emphasis> flows and outputs "TXREPORT" events to the
+      mgen log file. This is the transmit-side analogue of the received-flow <link
+      linkend="_ANALYTICS">analytics</link>/<link
+      linkend="_FLOW_REPORT">REPORT</link> capability: a TXREPORT is logged once
+      per measurement "<link linkend="_WINDOW">window</link>" for each sending
+      flow, giving the average transmitted rate and message count for that
+      window.</para>
+
+      <para>Analytics reporting is timer-driven and the measurement windows are
+      aligned to whole-window boundaries, so TXREPORT (and REPORT) events are
+      emitted on a steady interval with no gaps. Windows in which no messages were
+      sent are reported with a zero rate and count. The TXREPORT line format
+      is:</para>
+
+      <programlisting>1784297470.000000 TXREPORT proto&gt;UDP flow&gt;1 srcPort&gt;38115 dst&gt;127.0.0.1/5000 window&gt;1.000000 rate&gt;1638.400000 kbps, count&gt;200</programlisting>
+
+      <para>The "rate" and "count" fields report the offered load (the traffic
+      mgen generated for the flow) over the given "window". For TCP this reflects
+      data handed to the socket; because of TCP send buffering this may exceed what
+      is instantaneously placed on the wire. See <link
+      linkend="_TXWIRERATE">txWireRate</link> to additionally report the actual
+      wire throughput.</para>
+    </sect2>
+
+    <sect2 id="_TXWIRERATE">
+      <title id="_TXWIRERATE">TXWIRERATE</title>
+
+      <para>Script/command-line syntax:<literal/></para>
+
+      <para><literal>txWireRate {on|off}</literal></para>
+
+      <para>(Default: off.) When enabled, TCP <link
+      linkend="_TXANALYTICS">TXREPORT</link> events additionally report the actual
+      bytes drained from the kernel socket send buffer onto the network during each
+      measurement window, in addition to (not instead of) the legacy offered-load
+      "rate"/"count". A TCP sender can hand data to the socket faster than the
+      network carries it, so the offered "rate" reflects what mgen generated while
+      the added "wireRate" reflects what was actually transmitted.</para>
+
+      <para>With txWireRate enabled the TXREPORT line gains "wireRate" and
+      "wireBytes" fields:</para>
+
+      <programlisting>1784297470.000000 TXREPORT proto&gt;TCP flow&gt;1 srcPort&gt;49153 dst&gt;10.1.0.2/5000 window&gt;1.000000 rate&gt;12488.000000 kbps, count&gt;1115 wireRate&gt;3915.072000 kbps wireBytes&gt;489384</programlisting>
+
+      <para>"wireRate" is the average wire throughput (kbps) and "wireBytes" is the
+      raw number of bytes drained from the send buffer during the window. The
+      legacy "rate"/"count" fields are unchanged, preserving backward compatibility
+      for existing log parsers.</para>
+
+      <para>Notes and limitations:</para>
+
+      <itemizedlist>
+        <listitem>
+          <para>Applies to TCP only, measured via the Linux
+          <literal>SIOCOUTQ</literal> socket ioctl. On platforms without SIOCOUTQ,
+          "txWireRate on" logs a warning and reverts to offered-load
+          reporting.</para>
+        </listitem>
+
+        <listitem>
+          <para>The measurement requires a live socket, so the
+          "wireRate"/"wireBytes" fields are omitted for windows after a flow's
+          socket has closed.</para>
+        </listitem>
+
+        <listitem>
+          <para>Measurement is per socket; if multiple flows share a single TCP
+          connection, wire-rate reporting is disabled for them (with a warning)
+          because per-flow attribution is not possible.</para>
+        </listitem>
+
+        <listitem>
+          <para>On links with large buffering (bufferbloat), the actual wire
+          delivery is bursty at sub-second timescales, so the per-window "wireRate"
+          may itself appear spikey even though it accurately reflects the bytes
+          leaving the send buffer.</para>
+        </listitem>
+      </itemizedlist>
+    </sect2>
+
+    <sect2 id="_QUANTIZEWINDOW">
+      <title id="_QUANTIZEWINDOW">QUANTIZEWINDOW</title>
+
+      <para>Script/command-line syntax:<literal/></para>
+
+      <para><literal>quantizeWindow {on|off}</literal></para>
+
+      <para>(Default: on.) Controls whether the analytics measurement window size
+      is quantized to MGEN's compact time encoding. MGEN encodes the report
+      "window" field using a logarithmic quantization so it can be carried
+      efficiently in in-band <link linkend="_FLOW_REPORT">report</link> payloads.
+      With quantization on (the default) a requested window is snapped to the
+      nearest representable value -- for example a 1.0 second window is reported as
+      "window&gt;1.011211". With <literal>quantizeWindow off</literal> the exact
+      requested window value is used for local measurement and logging (e.g.
+      "window&gt;1.000000"), which is convenient when exact window boundaries are
+      desired.</para>
+
+      <para>Note: the <link linkend="_WINDOW">window</link> command itself always
+      stores a quantized value, so to observe an exact (unquantized) window, use
+      <literal>quantizeWindow off</literal> together with the default 1.0 second
+      window (i.e. do not also issue a "window" command).</para>
     </sect2>
 
     <sect2 id="_SUSPEND_GLOBAL">
