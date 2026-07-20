@@ -247,6 +247,26 @@ static void test_compute_drained_bytes()
     CHECK(MgenAnalytic::ComputeDrainedBytes(1000, 5000) == 0);
 }
 
+// ---- Test 12: SetWindowSize honors the quantize flag ----------------------
+static void test_set_window_size_quantize()
+{
+    printf("test_set_window_size_quantize\n");
+    // Exact window when quantize == false
+    MgenAnalytic a;
+    CHECK(InitAnalytic(a));
+    a.SetWindowSize(2.0, false);
+    a.TxUpdate(100, ProtoTime(10.0), 0);
+    a.FinalizeTxWindow();
+    CHECK_NEAR(a.GetReportDuration(), 2.0, 1e-9);        // exact, not quantized
+    // Quantized window when quantize == true (1.0 -> 1.011211)
+    MgenAnalytic b;
+    CHECK(InitAnalytic(b));
+    b.SetWindowSize(1.0, true);
+    b.TxUpdate(100, ProtoTime(10.0), 0);
+    b.FinalizeTxWindow();
+    CHECK_NEAR(b.GetReportDuration(), 1.011211, 1e-4);   // snapped to grid
+}
+
 int main(int /*argc*/, char* /*argv*/[])
 {
     printf("mgenAnalyticTest: running...\n");
@@ -261,6 +281,7 @@ int main(int /*argc*/, char* /*argv*/[])
     test_rx_duplicate();
     test_table_separation();
     test_compute_drained_bytes();
+    test_set_window_size_quantize();
 
     printf("\nmgenAnalyticTest: %d checks, %d failure(s)\n", checks, failures);
     if (0 != failures)

@@ -365,6 +365,20 @@ def scenario_quantize_window(chk, mgen, duration):
     if tx_on:
         chk.near(tx_on[0].window, 1.011211, 1e-4, "quantize ON: TX window == 1.011211")
 
+    # A "window" command now honors quantizeWindow off (given before it): an
+    # explicit 2.0s window is used verbatim, not snapped to the quantized grid.
+    recv_w, send_w = mgen.run_pair(
+        recv_args=["analytics", "quantizeWindow", "off", "window", "2.0",
+                   ev_recv[0], ev_recv[1]],
+        send_args=["txAnalytics", "quantizeWindow", "off", "window", "2.0",
+                   ev_send[0], ev_send[1]],
+        duration=max(dur, 5.0), stop_flows=[1], tag="qoff-w2")
+    rx_w = by_flow(parse_reports(recv_w), "REPORT").get(1, [])
+    chk.ge(len(rx_w), 1, "window+quantize off: got RX reports")
+    if rx_w:
+        chk.near(rx_w[0].window, 2.0, 1e-6,
+                 "window 2.0 + quantize off: RX window == 2.000000 (honored, not quantized)")
+
 
 def scenario_tx_wire_rate(chk, mgen, duration):
     """txWireRate on a TCP loopback flow.  The legacy rate>/count> fields must

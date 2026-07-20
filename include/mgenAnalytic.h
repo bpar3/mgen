@@ -84,10 +84,20 @@ class MgenAnalytic : public ProtoQueue::Item
                   double                 windowSize = MgenAnalytic::DEFAULT_WINDOW,
                   UINT32                 historyDepth = MgenAnalytic::DEFAULT_HISTORY);
         
-        void SetWindowSize(double windowSize)
+        // When "quantize" is true (default), the window is snapped to MGEN's
+        // compact time encoding; when false, the exact value is used (honors
+        // the "quantizeWindow off" global for local measurement/logging).
+        void SetWindowSize(double windowSize, bool quantize = true)
         {
-            UINT8 q = Report::QuantizeTimeValue(windowSize);
-            window_size = MgenAnalytic::Report::UnquantizeTimeValue(q);
+            if (quantize)
+            {
+                UINT8 q = Report::QuantizeTimeValue(windowSize);
+                window_size = MgenAnalytic::Report::UnquantizeTimeValue(q);
+            }
+            else if (windowSize > 0.0)
+            {
+                window_size = windowSize;
+            }
         }
         
         // Accumulate a transmitted message into the current window.

@@ -3426,10 +3426,12 @@ mgen: starting now ...
       "window&gt;1.000000"), which is convenient when exact window boundaries are
       desired.</para>
 
-      <para>Note: the <link linkend="_WINDOW">window</link> command itself always
-      stores a quantized value, so to observe an exact (unquantized) window, use
-      <literal>quantizeWindow off</literal> together with the default 1.0 second
-      window (i.e. do not also issue a "window" command).</para>
+      <para>Note: set <literal>quantizeWindow off</literal> before any <link
+      linkend="_WINDOW">window</link> command for it to take effect on that
+      window (global commands are processed in order). Reports transmitted
+      in-band via the <link linkend="_FLOW_REPORT">report</link> option still
+      carry a quantized window value in their compact payload encoding regardless
+      of this setting.</para>
     </sect2>
 
     <sect2 id="_SUSPEND_GLOBAL">

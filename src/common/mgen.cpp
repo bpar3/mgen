@@ -1693,18 +1693,27 @@ Mgen::CmdType Mgen::GetCmdType(const char* cmd)
 
 void Mgen::SetAnalyticWindow(double windowSize)
 {
-    // Note the window size is adjusted to nearest quantized value
     if (windowSize <= 0.0) return;
-    UINT8 q = MgenAnalytic::Report::QuantizeTimeValue(windowSize);
-    analytic_window = MgenAnalytic::Report::UnquantizeTimeValue(q);
+    // Honor the "quantizeWindow" flag (set it before "window" for it to take
+    // effect): quantize to MGEN's compact encoding when enabled, otherwise use
+    // the exact requested value for local measurement/logging.
+    if (window_quantize)
+    {
+        UINT8 q = MgenAnalytic::Report::QuantizeTimeValue(windowSize);
+        analytic_window = MgenAnalytic::Report::UnquantizeTimeValue(q);
+    }
+    else
+    {
+        analytic_window = windowSize;
+    }
     // Update existing averaging windows (both RX and TX tables)
     MgenAnalyticTable::Iterator iterator(analytic_table);
     MgenAnalytic* next;
     while (NULL != (next = iterator.GetNextItem()))
-        next->SetWindowSize(windowSize);
+        next->SetWindowSize(windowSize, window_quantize);
     MgenAnalyticTable::Iterator txIterator(tx_analytic_table);
     while (NULL != (next = txIterator.GetNextItem()))
-        next->SetWindowSize(windowSize);
+        next->SetWindowSize(windowSize, window_quantize);
 }  // end Mgen::SetAnalyticWindow()
 
 void Mgen::SetTxAnalyticWindow(double windowSize)
