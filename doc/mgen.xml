@@ -3361,11 +3361,11 @@ mgen: starting now ...
 
       <para>(Default: off.) When enabled, TCP <link
       linkend="_TXANALYTICS">TXREPORT</link> events additionally report the actual
-      bytes drained from the kernel socket send buffer onto the network during each
-      measurement window, in addition to (not instead of) the legacy offered-load
-      "rate"/"count". A TCP sender can hand data to the socket faster than the
-      network carries it, so the offered "rate" reflects what mgen generated while
-      the added "wireRate" reflects what was actually transmitted.</para>
+      bytes transmitted onto the network during each measurement window, in
+      addition to (not instead of) the legacy offered-load "rate"/"count". A TCP
+      sender can hand data to the socket faster than the network carries it, so the
+      offered "rate" reflects what mgen generated while the added "wireRate"
+      reflects what was actually put on the wire.</para>
 
       <para>With txWireRate enabled the TXREPORT line gains "wireRate" and
       "wireBytes" fields:</para>
@@ -3382,9 +3382,12 @@ mgen: starting now ...
       <itemizedlist>
         <listitem>
           <para>Applies to TCP only, measured via the Linux
-          <literal>SIOCOUTQ</literal> socket ioctl. On platforms without SIOCOUTQ,
-          "txWireRate on" logs a warning and reverts to offered-load
-          reporting.</para>
+          <literal>SIOCOUTQNSD</literal> ("not sent only") socket ioctl so the
+          per-window value reflects bytes actually put on the wire rather than
+          bytes acknowledged. On non-Linux platforms "txWireRate on" logs a
+          warning and reverts to offered-load reporting. (The measured wire bytes
+          exclude TCP/IP headers and retransmissions, so they read slightly below
+          a packet-capture of the same flow.)</para>
         </listitem>
 
         <listitem>

@@ -223,24 +223,35 @@ void MgenAnalytic::FinalizeTxWindow()
                       ((double)byte_count / report_duration) : 0.0;
 
     // Optional TCP wire-rate accounting reported ALONGSIDE (not instead of) the
-    // offered load: bytes actually drained from the kernel send queue this
-    // window, sampled via SIOCOUTQ.  Left invalid (and unlogged) otherwise.
+    // offered load: bytes actually transmitted onto the network this window.
+    // Left invalid (and unlogged) otherwise.
     report_wire_valid = false;
     report_wire_bytes = 0;
     report_wire_rate_ave = 0.0;
 #ifdef LINUX
     if (tx_wire_rate && (NULL != tx_socket) && tx_socket->IsConnected())
     {
+        // Query the "not sent only" send-queue backlog (SIOCOUTQNSD): its
+        // per-window decrease reflects bytes actually put on the wire.  We do
+        // NOT use SIOCOUTQ here -- that is "not sent + not acked", so its
+        // decrease is ACK-clocked and, on high-RTT/bufferbloated links, lags
+        // real transmission (reporting 0 in windows where the wire was busy but
+        // ACKs had not yet returned).  Fall back to SIOCOUTQ on older headers.
+#ifdef SIOCOUTQNSD
+        const int txQueueQuery = SIOCOUTQNSD;
+#else
+        const int txQueueQuery = SIOCOUTQ;
+#endif
         int q = 0;
-        if (0 == ioctl(tx_socket->GetHandle(), SIOCOUTQ, &q))
+        if (0 == ioctl(tx_socket->GetHandle(), txQueueQuery, &q))
         {
             unsigned long queue_now = (unsigned long)q;
             long queue_delta = (long)queue_now - (long)tx_queue_prev;
-            unsigned long drained =
+            unsigned long transmitted =
                 ComputeDrainedBytes(tx_written_total - tx_written_prev, queue_delta);
-            report_wire_bytes = drained;
+            report_wire_bytes = transmitted;
             report_wire_rate_ave = (report_duration > 0.0) ?
-                                   ((double)drained / report_duration) : 0.0;
+                                   ((double)transmitted / report_duration) : 0.0;
             report_wire_valid = true;
             tx_written_prev = tx_written_total;
             tx_queue_prev = queue_now;

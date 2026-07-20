@@ -156,10 +156,11 @@ class MgenAnalytic : public ProtoQueue::Item
         void AddTxWrittenBytes(unsigned long byteCount)
             {tx_written_total += byteCount;}
 
-        // Bytes drained onto the wire during a window = bytes newly written
-        // into the send buffer minus the change in send-queue occupancy
-        // (queueDelta = queueNow - queuePrev).  Clamped at zero.  Exposed as a
-        // static pure function so the wire-rate arithmetic is unit-testable.
+        // Bytes that left the tracked send-queue during a window = bytes newly
+        // written into the send buffer minus the change in queue occupancy
+        // (queueDelta = queueNow - queuePrev).  Clamped at zero.  With the
+        // "not sent only" queue (SIOCOUTQNSD) this is bytes transmitted onto the
+        // wire.  Exposed as a static pure function so the arithmetic is testable.
         static unsigned long ComputeDrainedBytes(unsigned long writtenDelta,
                                                  long          queueDelta)
         {
