@@ -33,6 +33,12 @@
 #ifndef _MGEN_GLOBALS
 #define _MGEN_GLOBALS
 
+#ifdef WIN32
+#include <windows.h>
+#else
+#include <time.h>
+#endif  // if/else WIN32
+
 enum LogEventType
   {
     INVALID_EVENT = 0,
@@ -94,7 +100,76 @@ enum MessageStatus
     MSG_SEND_FAILED,
     MSG_SEND_BLOCKED,
     MSG_SEND_OK
-    
+
   };
+
+// TCP dispatch-loop fairness: bounds how long an unlimited-rate TCP flow's
+// send/recv work can run inside a single dispatcher callback so it cannot
+// delay the once-per-second analytics report boundary.  See
+// MgenDispatchBudget below.
+const double       MGEN_DISPATCH_BUDGET_SECONDS = 0.002;      // 2 ms wall-clock slice
+const unsigned int MGEN_DISPATCH_BUDGET_OPS = 64;             // completed-op cap
+const double       MGEN_ANALYTIC_BOUNDARY_THRESHOLD = 0.001;  // yield-ahead margin
+
+/**
+ * Returns a monotonic clock reading in seconds, immune to system clock
+ * steps (NTP, manual adjustment).  Used only to measure elapsed time for
+ * MgenDispatchBudget; unlike ProtoTime/ProtoSystemTime it is not tied to
+ * wall-clock epoch and must not be used for reporting or logging.
+ */
+inline double MgenMonotonicSeconds()
+{
+#ifdef WIN32
+    static LARGE_INTEGER frequency = {0};
+    if (0 == frequency.QuadPart)
+        QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER count;
+    QueryPerformanceCounter(&count);
+    return (double)count.QuadPart / (double)frequency.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (1.0e-09 * (double)ts.tv_nsec);
+#endif  // if/else WIN32
+}  // end MgenMonotonicSeconds()
+
+/**
+ * @class MgenDispatchBudget
+ *
+ * @brief Bounds one dispatcher callback's TCP send/recv work loop by both a
+ * wall-clock time slice and a completed-operation count.  Without this,
+ * an unlimited-rate TCP flow's send or receive loop can monopolize the
+ * single Protolib dispatcher callback long enough to skip a one-second
+ * analytics report boundary, corrupting stream byte accounting.
+ */
+class MgenDispatchBudget
+{
+    public:
+        MgenDispatchBudget()
+          : active(false), op_count(0), op_limit(0), deadline(0.0) {}
+
+        void Start(double wallClockBudgetSeconds, unsigned int opLimit)
+        {
+            active = true;
+            op_count = 0;
+            op_limit = opLimit;
+            deadline = MgenMonotonicSeconds() + wallClockBudgetSeconds;
+        }
+
+        void RecordOp() {op_count++;}
+
+        bool IsExpired() const
+        {
+            if (!active) return false;
+            if ((op_limit > 0) && (op_count >= op_limit)) return true;
+            return MgenMonotonicSeconds() >= deadline;
+        }
+
+    private:
+        bool          active;
+        unsigned int  op_count;
+        unsigned int  op_limit;
+        double        deadline;
+};  // end class MgenDispatchBudget
 
 #endif // _MGEN_GLOBALS

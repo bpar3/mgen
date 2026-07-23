@@ -418,6 +418,15 @@ class Mgen
     void SetTxAnalyticWindow(double windowSize); // For TX table
     double GetAnalyticWindow() const
         {return analytic_window;}
+    // Returns true when the periodic analytics timer is scheduled to fire
+    // within "thresholdSeconds".  TCP send/recv dispatch loops use this to
+    // stop before starting another unit of work so bulk I/O cannot delay
+    // the report boundary.
+    bool IsAnalyticBoundaryDue(double thresholdSeconds) const
+    {
+        return analytic_timer.IsActive() &&
+               (analytic_timer.GetTimeRemaining() <= thresholdSeconds);
+    }
     void SetTcpStreamAnalytics(bool state)
         {tcp_stream_analytics = state;}
     bool GetTcpStreamAnalytics() const

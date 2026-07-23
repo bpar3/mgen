@@ -209,23 +209,35 @@ void MgenTransport::PrintList()
 
 bool MgenTransport::SendPendingMessage()
 {
-    // break out of while loop after N iterations to resume asynch i/o
-    unsigned int breakOut = 0;
-    unsigned int pending_message_limit = 10000;
-    
-    // Send pending messages until we hit congestion
-    // or clear the queue...
+    // Bound this dispatcher callback's send work by both a wall-clock slice
+    // and a completed-message count, so an unlimited-rate flow cannot run
+    // long enough to delay the once-per-second analytics report boundary.
+    MgenDispatchBudget budget;
+    budget.Start(MGEN_DISPATCH_BUDGET_SECONDS, MGEN_DISPATCH_BUDGET_OPS);
+
+    // Send pending messages until we hit congestion, clear the queue, or
+    // exhaust our dispatch budget...
     while (IsOpen() && !IsTransmitting() && pending_current)
     {
-      breakOut++;
+      // Yield before starting another send unit if the budget is spent or
+      // an analytics boundary is imminent.  Output notification stays
+      // enabled so ProtoDispatcher resumes this flow on the next callback.
+      if (budget.IsExpired() ||
+          mgen.IsAnalyticBoundaryDue(MGEN_ANALYTIC_BOUNDARY_THRESHOLD))
+      {
+          StartOutputNotification();
+          return true;
+      }
+
       int msgLimit = pending_current->GetMessageLimit();
       bool sendMore = (msgLimit < 0) || (pending_current->GetMessagesSent() < msgLimit);
       
-      if ((pending_current->GetPending() > 0) || 
+      if ((pending_current->GetPending() > 0) ||
           (pending_current->UnlimitedRate() && sendMore))
       {
-          if (!pending_current->SendMessage()) 
+          if (!pending_current->SendMessage())
               return false;
+          budget.RecordOp();
       }
       
       // Restart flow timer if we're below the queue limit
@@ -281,15 +293,6 @@ bool MgenTransport::SendPendingMessage()
       // reached the end.
       if (!pending_current && pending_head)
           pending_current = pending_head;
-
-      if (breakOut > pending_message_limit)
-      {
-          // If we've met our pending_message_limit break out
-          // of our tight loop sending messages as fast as possible
-          // to service any off events.
-          return true;
-      }
-      
     }
     // Resume normal operations
     if (!IsTransmitting() && !HasPendingFlows()) 
@@ -1161,14 +1164,28 @@ void MgenTcpTransport::OnEvent(ProtoSocket& theSocket,ProtoSocket::Event theEven
     {
     case ProtoSocket::SEND:
       {
-          // Send anything pending in the transport buffer 
-          // until we have transmission failure.  (Note that 
+          // Send anything pending in the transport buffer
+          // until we have transmission failure.  (Note that
           // tx_buffer_pending may be zero if we haven't connected
-          // yet so we let SendPendingMessages will kick things off 
+          // yet so we let SendPendingMessages will kick things off
           // for us.
+          //
+          // Bound this callback's work by a dispatch budget so an
+          // unlimited-rate flow cannot delay the analytics report
+          // boundary.  tx_buffer_index/tx_buffer_pending/tx_msg are
+          // transport member state, so a mid-buffer yield loses nothing;
+          // the next SEND event resumes exactly here.
+          MgenDispatchBudget sendBudget;
+          sendBudget.Start(MGEN_DISPATCH_BUDGET_SECONDS, MGEN_DISPATCH_BUDGET_OPS);
           while (1)
           {
-              unsigned int numBytes = tx_buffer_pending; 
+              if (sendBudget.IsExpired() ||
+                  mgen.IsAnalyticBoundaryDue(MGEN_ANALYTIC_BOUNDARY_THRESHOLD))
+              {
+                  StartOutputNotification();
+                  return;
+              }
+              unsigned int numBytes = tx_buffer_pending;
               struct timeval writeTime;
               ProtoSystemTime(writeTime);
               if (numBytes > 0)
@@ -1179,7 +1196,7 @@ void MgenTcpTransport::OnEvent(ProtoSocket& theSocket,ProtoSocket::Event theEven
                   // tell us when to try again.
                   if (tx_buffer_pending != 0 && numBytes == 0)
                   {
-                      StartOutputNotification(); 
+                      StartOutputNotification();
                       return;
                   }
 
@@ -1187,31 +1204,42 @@ void MgenTcpTransport::OnEvent(ProtoSocket& theSocket,ProtoSocket::Event theEven
                   {
                       mgen.UpdateSendAnalytics(writeTime, numBytes, &tx_msg,
                                                &socket, false);
+                      sendBudget.RecordOp();
                   }
 
                   // Get next buffer to send, if all done, send any pending
-                  // messages that have accumulated. 
+                  // messages that have accumulated.
                   if (!GetNextTxBuffer(numBytes))
                   {
                       StopOutputNotification();
                       break;
                   }
               } // Some other socket failure!
-              else 
+              else
               {
                   break;
               }
           }
-          SendPendingMessage(); 
+          SendPendingMessage();
 
           break;
       }
       
     case ProtoSocket::RECV:
-      
+
       {
+          // Bound this callback's work by a dispatch budget so a continuous
+          // TCP reader cannot delay the analytics report boundary.  On
+          // yield we return without draining the socket further; input
+          // notification stays enabled (level-triggered) so ProtoDispatcher
+          // re-fires RECV for the remaining bytes.
+          MgenDispatchBudget recvBudget;
+          recvBudget.Start(MGEN_DISPATCH_BUDGET_SECONDS, MGEN_DISPATCH_BUDGET_OPS);
           while (1)
           {
+              if (recvBudget.IsExpired() ||
+                  mgen.IsAnalyticBoundaryDue(MGEN_ANALYTIC_BOUNDARY_THRESHOLD))
+                  return;
 
               unsigned int bufferIndex = ((TX_BUFFER_SIZE + rx_msg_index) % TX_BUFFER_SIZE);
               unsigned int numBytes = GetRxNumBytes(bufferIndex);
@@ -1235,6 +1263,7 @@ void MgenTcpTransport::OnEvent(ProtoSocket& theSocket,ProtoSocket::Event theEven
                     else
                         rx_stream_pending += numBytes;
                     OnRecvMsg(numBytes, bufferIndex, buffer);
+                    recvBudget.RecordOp();
                   }
                   else
                   {
@@ -1360,16 +1389,28 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
     // sent and packs the message
     tx_fragment_pending = GetNextTxFragment();
     
-    if (!tx_fragment_pending || !tx_buffer_pending) 
+    if (!tx_fragment_pending || !tx_buffer_pending)
     {
         DMSG(0,"SendTcpMessage Error: No fragment pending!\n");
         return MSG_SEND_FAILED;
     }
-    
+
+    // NOTE: this fragment loop is intentionally not budget-bounded like the
+    // other TCP dispatch loops.  Its MSG_SEND_BLOCKED return is observed by
+    // MgenFlow::SendMessage(), which rolls back the flow's sequence number
+    // on any non-MSG_SEND_OK result; a voluntary yield returned the same
+    // way here would trigger that rollback on every yield instead of only
+    // on genuine socket backpressure, in violation of the Phase 1 "do not
+    // roll back flow sequence numbers for a voluntary yield" constraint.
+    // Each mgen message is capped at MAX_SIZE bytes, so this loop's own
+    // runtime is bounded independent of dispatch fairness; the outer
+    // SendPendingMessage() budget still bounds how many such messages are
+    // dispatched per callback.
+
     //  Send message, checking for error (log only on success)
     while (1)
     {
-        unsigned int numBytes = tx_buffer_pending;   
+        unsigned int numBytes = tx_buffer_pending;
         struct timeval writeTime;
         ProtoSystemTime(writeTime);
         if (numBytes > 0)
@@ -1378,7 +1419,7 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
             &&
             socket.Send(((char*)tx_msg_buffer)+tx_buffer_index,numBytes))
         {
-            // If we had an error, let socket notification tell 
+            // If we had an error, let socket notification tell
             // us when to try again...
             if (tx_buffer_pending != 0 && numBytes == 0)
             {
@@ -1391,7 +1432,7 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
                 mgen.UpdateSendAnalytics(writeTime, numBytes, &tx_msg,
                                          &socket, false);
             }
-            
+
             // Otherwise keep track of what we've sent
             tx_buffer_index += numBytes;
             tx_buffer_pending -= numBytes;
