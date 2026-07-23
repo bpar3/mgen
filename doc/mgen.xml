@@ -134,7 +134,7 @@
      [report] [suspend &lt;flowId(s)&gt;] [resume &lt;flowId(s)&gt;] [reset &lt;flowId(s)&gt;]
      [retry &lt;count&gt;[/&lt;delay&gt;]
      [epochtimestamp]
-     [quantizeWindow {on|off}][txAnalytics][txWireRate {on|off}]
+     [quantizeWindow {on|off}][txAnalytics][tcpStreamAnalytics {on|off}]
 
 </programlisting>
 
@@ -777,13 +777,11 @@
           </row>
 
           <row>
-            <entry><literal>txWireRate {on|off}</literal></entry>
+            <entry><literal>tcpStreamAnalytics {on|off}</literal></entry>
 
-            <entry>When enabled, TCP <link
-            linkend="_TXANALYTICS">TXREPORT</link> events additionally report the
-            actual bytes drained onto the network ("wireRate"/"wireBytes"), in
-            addition to the offered load.<para>See <link
-            linkend="_TXWIRERATE">txWireRate</link> for more detailed
+            <entry>When enabled, TCP TXREPORT and REPORT events additionally
+            report unique TCP byte-stream progress at each endpoint.<para>See <link
+            linkend="_TCPSTREAMANALYTICS">tcpStreamAnalytics</link> for more detailed
             information.</para></entry>
           </row>
 
@@ -3344,69 +3342,58 @@ mgen: starting now ...
 
       <programlisting>1784297470.000000 TXREPORT proto&gt;UDP flow&gt;1 srcPort&gt;38115 dst&gt;127.0.0.1/5000 window&gt;1.000000 rate&gt;1638.400000 kbps, count&gt;200</programlisting>
 
-      <para>The "rate" and "count" fields report the offered load (the traffic
-      mgen generated for the flow) over the given "window". For TCP this reflects
-      data handed to the socket; because of TCP send buffering this may exceed what
-      is instantaneously placed on the wire. See <link
-      linkend="_TXWIRERATE">txWireRate</link> to additionally report the actual
-      wire throughput.</para>
+      <para>The "rate" and "count" fields report complete MGEN messages written
+      during the given "window". For TCP byte-stream progress independent of
+      MGEN message boundaries, see <link
+      linkend="_TCPSTREAMANALYTICS">tcpStreamAnalytics</link>.</para>
     </sect2>
 
-    <sect2 id="_TXWIRERATE">
-      <title id="_TXWIRERATE">TXWIRERATE</title>
+    <sect2 id="_TCPSTREAMANALYTICS">
+      <title id="_TCPSTREAMANALYTICS">TCPSTREAMANALYTICS</title>
 
       <para>Script/command-line syntax:<literal/></para>
 
-      <para><literal>txWireRate {on|off}</literal></para>
+      <para><literal>tcpStreamAnalytics {on|off}</literal></para>
 
-      <para>(Default: off.) When enabled, TCP <link
-      linkend="_TXANALYTICS">TXREPORT</link> events additionally report the actual
-      bytes transmitted onto the network during each measurement window, in
-      addition to (not instead of) the legacy offered-load "rate"/"count". A TCP
-      sender can hand data to the socket faster than the network carries it, so the
-      offered "rate" reflects what mgen generated while the added "wireRate"
-      reflects what was actually put on the wire.</para>
+      <para>(Default: off.) When enabled, local TCP TXREPORT and REPORT events
+      additionally report unique TCP byte-stream progress during each measurement
+      window. The legacy "rate"/"count" fields remain complete MGEN-message
+      metrics.</para>
 
-      <para>With txWireRate enabled the TXREPORT line gains "wireRate" and
-      "wireBytes" fields:</para>
+      <para>TCP reports gain a validity field and, when valid, stream rate and byte
+      fields:</para>
 
-      <programlisting>1784297470.000000 TXREPORT proto&gt;TCP flow&gt;1 srcPort&gt;49153 dst&gt;10.1.0.2/5000 window&gt;1.000000 rate&gt;12488.000000 kbps, count&gt;1115 wireRate&gt;3915.072000 kbps wireBytes&gt;489384</programlisting>
+      <programlisting>1784297470.000000 TXREPORT proto&gt;TCP flow&gt;1 srcPort&gt;49153 dst&gt;10.1.0.2/5000 window&gt;1.000000 rate&gt;12488.000000 kbps, count&gt;1115 tcpStreamValid&gt;1 tcpStreamRate&gt;3915.072000 kbps tcpStreamBytes&gt;489384</programlisting>
 
-      <para>"wireRate" is the average wire throughput (kbps) and "wireBytes" is the
-      raw number of bytes drained from the send buffer during the window. The
-      legacy "rate"/"count" fields are unchanged, preserving backward compatibility
-      for existing log parsers.</para>
+      <para>On TX, the metric counts unique bytes leaving TCP's not-sent queue. On
+      RX, it counts unique in-order bytes entering the readable receive queue.
+      It excludes TCP/IP headers, retransmissions, acknowledgements, and link-layer
+      overhead, and is not an interface or physical wire-rate measurement.</para>
 
       <para>Notes and limitations:</para>
 
       <itemizedlist>
         <listitem>
-          <para>Applies to TCP only, measured via the Linux
-          <literal>SIOCOUTQNSD</literal> ("not sent only") socket ioctl so the
-          per-window value reflects bytes actually put on the wire rather than
-          bytes acknowledged. On non-Linux platforms "txWireRate on" logs a
-          warning and reverts to offered-load reporting. (The measured wire bytes
-          exclude TCP/IP headers and retransmissions, so they read slightly below
-          a packet-capture of the same flow.)</para>
+          <para>Applies to TCP only. Linux TX sampling uses
+          <literal>SIOCOUTQNSD</literal>; RX sampling uses
+          <literal>SIOCINQ</literal>. Unsupported platforms omit stream fields.</para>
         </listitem>
 
         <listitem>
-          <para>The measurement requires a live socket, so the
-          "wireRate"/"wireBytes" fields are omitted for windows after a flow's
-          socket has closed.</para>
+          <para>"tcpStreamValid&gt;0" indicates a closed socket, failed sample,
+          application-checksummed receive stream, or delayed boundary whose
+          per-window value cannot be reconstructed.</para>
         </listitem>
 
         <listitem>
-          <para>Measurement is per socket; if multiple flows share a single TCP
-          connection, wire-rate reporting is disabled for them (with a warning)
-          because per-flow attribution is not possible.</para>
+          <para>Measurement is per socket. Per-flow stream attribution is not
+          available when multiple MGEN flows share one TCP connection.</para>
         </listitem>
 
         <listitem>
-          <para>On links with large buffering (bufferbloat), the actual wire
-          delivery is bursty at sub-second timescales, so the per-window "wireRate"
-          may itself appear spikey even though it accurately reflects the bytes
-          leaving the send buffer.</para>
+          <para>TX and RX values need not match in the same window because data may
+          be buffered or in flight. Their cumulative values converge after the
+          stream drains.</para>
         </listitem>
       </itemizedlist>
     </sect2>

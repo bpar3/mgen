@@ -402,6 +402,13 @@ private:
     UINT16                  rx_fragment_pending;
     UINT16                  rx_msg_index;
     UINT32                  rx_checksum;
+    MgenMsg                 rx_stream_msg;
+    bool                    rx_stream_bound;
+    unsigned long long      rx_stream_pending;
+    unsigned int            rx_logical_msg_len;
+    UINT32                  rx_logical_seq_num;
+    bool                    rx_logical_msg_pending;
+    bool                    rx_logical_msg_discard;
 
     int                     retry_count;
     unsigned int            retry_delay;

@@ -1,7 +1,7 @@
 /*
  * mgenAnalyticTest - standalone unit tests for MgenAnalytic window
  * accumulation / finalization logic (the timer-driven, whole-second-aligned
- * TX/RX analytics and the txWireRate drain accounting).
+ * TX/RX message analytics and symmetric TCP stream accounting).
  *
  * This is a plain assertion-based driver in the style of protolib's
  * examples/unitTests.cpp (MGEN has no unit-test framework).  It exercises
@@ -82,10 +82,10 @@ static void test_window_elapsed()
     CHECK(a.WindowElapsed(ProtoTime(120.5)));
 }
 
-// ---- Test 3: TX offered-load rate & count over one window ------------------
-static void test_tx_offered_rate()
+// ---- Test 3: TX complete-message rate & count over one window --------------
+static void test_tx_message_rate()
 {
-    printf("test_tx_offered_rate\n");
+    printf("test_tx_message_rate\n");
     MgenAnalytic a;
     CHECK(InitAnalytic(a));
     for (UINT32 i = 0; i < 100; i++)
@@ -233,18 +233,18 @@ static void test_table_separation()
     delete rxA;
 }
 
-// ---- Test 11: wire-rate drain arithmetic (ComputeDrainedBytes) -------------
-static void test_compute_drained_bytes()
+// ---- Test 11: symmetric TCP stream queue arithmetic ------------------------
+static void test_tcp_stream_bytes()
 {
-    printf("test_compute_drained_bytes\n");
-    // Steady state: everything written this window drained (queue unchanged)
-    CHECK(MgenAnalytic::ComputeDrainedBytes(10000, 0) == 10000);
-    // Buffer grew: offered 10000, but 4000 still sitting in the queue -> 6000 on wire
-    CHECK(MgenAnalytic::ComputeDrainedBytes(10000, 4000) == 6000);
-    // Buffer shrank: wrote 2000 this window, queue drained an extra 3000 -> 5000 on wire
-    CHECK(MgenAnalytic::ComputeDrainedBytes(2000, -3000) == 5000);
-    // Clamp: queue grew more than we wrote -> 0 (never a negative/underflowed rate)
-    CHECK(MgenAnalytic::ComputeDrainedBytes(1000, 5000) == 0);
+    printf("test_tcp_stream_bytes\n");
+    CHECK(MgenAnalytic::ComputeTxStreamBytes(10000, 0) == 10000);
+    CHECK(MgenAnalytic::ComputeTxStreamBytes(10000, 4000) == 6000);
+    CHECK(MgenAnalytic::ComputeTxStreamBytes(2000, -3000) == 5000);
+    CHECK(MgenAnalytic::ComputeTxStreamBytes(1000, 5000) == 0);
+    CHECK(MgenAnalytic::ComputeRxStreamBytes(10000, 0) == 10000);
+    CHECK(MgenAnalytic::ComputeRxStreamBytes(6000, 4000) == 10000);
+    CHECK(MgenAnalytic::ComputeRxStreamBytes(10000, -4000) == 6000);
+    CHECK(MgenAnalytic::ComputeRxStreamBytes(1000, -5000) == 0);
 }
 
 // ---- Test 12: SetWindowSize honors the quantize flag ----------------------
@@ -272,7 +272,7 @@ int main(int /*argc*/, char* /*argv*/[])
     printf("mgenAnalyticTest: running...\n");
     test_boundary_alignment();
     test_window_elapsed();
-    test_tx_offered_rate();
+    test_tx_message_rate();
     test_tx_gap_fill();
     test_rx_basic();
     test_rx_loss_gap();
@@ -280,7 +280,7 @@ int main(int /*argc*/, char* /*argv*/[])
     test_rx_empty_window();
     test_rx_duplicate();
     test_table_separation();
-    test_compute_drained_bytes();
+    test_tcp_stream_bytes();
     test_set_window_size_quantize();
 
     printf("\nmgenAnalyticTest: %d checks, %d failure(s)\n", checks, failures);

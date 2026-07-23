@@ -1,11 +1,11 @@
 
 #include "mgenAnalytic.h"
 #include "mgen.h"  // for logging
-#include "protoSocket.h"  // for TX wire-rate send-queue query
+#include "protoSocket.h"  // for TCP stream queue queries
 #include <string.h>  // for memcpy()
 #ifdef LINUX
 #include <sys/ioctl.h>     // for ioctl()
-#include <linux/sockios.h> // for SIOCOUTQ
+#include <linux/sockios.h> // for SIOCOUTQNSD/SIOCINQ
 #endif // LINUX
 
 const double MgenAnalytic::DEFAULT_WINDOW = 1.0;
@@ -13,10 +13,13 @@ const double MgenAnalytic::DEFAULT_WINDOW = 1.0;
 MgenAnalytic::MgenAnalytic()
  : flow_key(NULL), flow_keysize(0), window_size(DEFAULT_WINDOW), window_valid(false),
    msg_count(0), byte_count(0), dup_msg_count(0), latency_sum(0.0),
-   tx_socket(NULL), tx_wire_rate(false), tx_written_total(0),
-   tx_written_prev(0), tx_queue_prev(0),
+   tcp_stream_socket(NULL), tcp_stream_enabled(false), tcp_stream_is_tx(false),
+   tcp_stream_attributable(true), tcp_queue_initialized(false),
+   tcp_window_sample_valid(false), tcp_io_total(0), tcp_io_prev(0),
+   tcp_queue_prev(0),
    report_valid(false), report_msg_count(0),
-   report_wire_valid(false), report_wire_rate_ave(0.0), report_wire_bytes(0)
+   report_tcp_stream_valid(false), report_tcp_stream_rate_ave(0.0),
+   report_tcp_stream_bytes(0)
 {
     // Adjust set window_size to quantized version
     UINT8 q = Report::QuantizeTimeValue(window_size);
@@ -88,6 +91,82 @@ bool MgenAnalytic::Init(Protocol               protocol,
     report_msg.SetWindowSize(window_size);  // this must come after
     return true;
 }  // end MgenAnalytic::Init()
+
+void MgenAnalytic::SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
+                                bool includeQueuedBytes)
+{
+    bool socketChanged = tcp_stream_socket != theSocket || tcp_stream_is_tx != isTx;
+    bool enabledChanged = tcp_stream_enabled != enabled;
+    if (socketChanged || enabledChanged)
+    {
+        tcp_stream_socket = theSocket;
+        tcp_stream_is_tx = isTx;
+        if (socketChanged)
+            tcp_stream_attributable = true;
+        tcp_queue_initialized = false;
+        tcp_window_sample_valid = false;
+        tcp_io_total = 0;
+        tcp_io_prev = 0;
+        tcp_queue_prev = 0;
+    }
+    tcp_stream_enabled = enabled;
+
+    if (includeQueuedBytes && !tcp_stream_is_tx && !tcp_queue_initialized)
+    {
+        // A newly identified RX flow owns all bytes currently queued on its
+        // single-flow socket, including bytes received before header parsing.
+        tcp_queue_prev = 0;
+        tcp_io_prev = 0;
+        tcp_queue_initialized = true;
+    }
+
+#if defined(LINUX) && defined(SIOCOUTQNSD) && defined(SIOCINQ)
+    if (tcp_stream_enabled && tcp_stream_attributable &&
+        !tcp_queue_initialized && NULL != tcp_stream_socket &&
+        tcp_stream_socket->IsConnected())
+    {
+        int queueValue = 0;
+        const int query = tcp_stream_is_tx ? SIOCOUTQNSD : SIOCINQ;
+        if (0 == ioctl(tcp_stream_socket->GetHandle(), query, &queueValue))
+        {
+            tcp_queue_prev = (unsigned long long)queueValue;
+            tcp_io_prev = tcp_io_total;
+            tcp_queue_initialized = true;
+        }
+    }
+#endif
+}
+
+void MgenAnalytic::ClearTcpStreamSocket()
+{
+    tcp_stream_socket = NULL;
+    tcp_stream_attributable = true;
+    tcp_queue_initialized = false;
+    tcp_window_sample_valid = false;
+    tcp_io_total = 0;
+    tcp_io_prev = 0;
+    tcp_queue_prev = 0;
+}
+
+void MgenAnalytic::AddTcpStreamIoBytes(unsigned long long byteCount,
+                                       const ProtoTime& eventTime)
+{
+    if (!tcp_stream_enabled || !tcp_stream_attributable)
+        return;
+    if (!window_valid)
+    {
+        window_valid = true;
+        double t = eventTime.GetValue();
+        double startVal = floor(t / window_size) * window_size;
+        window_start = ProtoTime(startVal);
+        window_end = ProtoTime(startVal + window_size);
+        msg_count = 0;
+        byte_count = 0;
+        dup_msg_count = 0;
+        latency_sum = 0.0;
+    }
+    tcp_io_total += byteCount;
+}
 
 
 bool MgenAnalytic::TxUpdate(unsigned int     msgSize,
@@ -193,18 +272,82 @@ void MgenAnalytic::TxLog(FILE*            filePtr,
     ProtoAddress dstAddr;
     report_msg.GetDstAddr(dstAddr);
     Mgen::Log(filePtr, "dst>%s/%hu ", dstAddr.GetHostString(), dstAddr.GetPort());
-    // Legacy offered-load fields are always present and self-consistent.
+    // Complete-message fields are always present and self-consistent.
     Mgen::Log(filePtr,"window>%lf rate>%lf kbps, count>%lu",
                 report_duration, report_rate_ave*8.0e-03, report_msg_count);
-    // When txWireRate is enabled, append the actual wire throughput measured
-    // for this window (bytes drained from the kernel send buffer).
-    if (report_wire_valid)
-        Mgen::Log(filePtr," wireRate>%lf kbps wireBytes>%lu",
-                    report_wire_rate_ave*8.0e-03, report_wire_bytes);
+    if (tcp_stream_enabled)
+    {
+        Mgen::Log(filePtr," tcpStreamValid>%u", report_tcp_stream_valid ? 1 : 0);
+        if (report_tcp_stream_valid)
+            Mgen::Log(filePtr," tcpStreamRate>%lf kbps tcpStreamBytes>%llu",
+                      report_tcp_stream_rate_ave*8.0e-03,
+                      report_tcp_stream_bytes);
+    }
     Mgen::Log(filePtr,"\n");
 }  // end MgenAnalytic::TxLog()
 
-void MgenAnalytic::FinalizeTxWindow()
+void MgenAnalytic::FinalizeTcpStream(bool sampleTcpStream)
+{
+    report_tcp_stream_valid = false;
+    report_tcp_stream_rate_ave = 0.0;
+    report_tcp_stream_bytes = 0;
+    if (!tcp_stream_enabled || !tcp_stream_attributable || NULL == tcp_stream_socket)
+        return;
+
+#if defined(LINUX) && defined(SIOCOUTQNSD) && defined(SIOCINQ)
+    if (!tcp_stream_socket->IsConnected())
+    {
+        tcp_queue_initialized = false;
+        tcp_window_sample_valid = false;
+        tcp_io_prev = tcp_io_total;
+        return;
+    }
+
+    int queueValue = 0;
+    const int query = tcp_stream_is_tx ? SIOCOUTQNSD : SIOCINQ;
+    if (0 != ioctl(tcp_stream_socket->GetHandle(), query, &queueValue))
+    {
+        tcp_queue_initialized = false;
+        tcp_window_sample_valid = false;
+        tcp_io_prev = tcp_io_total;
+        return;
+    }
+
+    unsigned long long queueNow = (unsigned long long)queueValue;
+    if (!tcp_queue_initialized)
+    {
+        // Establish a clean baseline; the elapsed window cannot be recovered.
+        tcp_queue_prev = queueNow;
+        tcp_io_prev = tcp_io_total;
+        tcp_queue_initialized = true;
+        tcp_window_sample_valid = false;
+        return;
+    }
+
+    unsigned long long ioDelta = tcp_io_total - tcp_io_prev;
+    long long queueDelta = (long long)queueNow - (long long)tcp_queue_prev;
+    tcp_io_prev = tcp_io_total;
+    tcp_queue_prev = queueNow;
+
+    if (!sampleTcpStream || !tcp_window_sample_valid)
+    {
+        tcp_window_sample_valid = true;
+        return;  // Rebaseline without inventing a complete-window sample.
+    }
+
+    report_tcp_stream_bytes = tcp_stream_is_tx ?
+        ComputeTxStreamBytes(ioDelta, queueDelta) :
+        ComputeRxStreamBytes(ioDelta, queueDelta);
+    report_tcp_stream_rate_ave = (report_duration > 0.0) ?
+        ((double)report_tcp_stream_bytes / report_duration) : 0.0;
+    report_tcp_stream_valid = true;
+    tcp_window_sample_valid = true;
+#else
+    (void)sampleTcpStream;
+#endif
+}
+
+void MgenAnalytic::FinalizeTxWindow(bool sampleTcpStream)
 {
     if (!window_valid)
         return;
@@ -215,51 +358,15 @@ void MgenAnalytic::FinalizeTxWindow()
     report_start = window_start;
     report_duration = window_size;
 
-    // Legacy offered-load metrics: rate/count always reflect what mgen offered
-    // (handed to the socket) this window, so the report is self-consistent
-    // (rate == count*size*8/window) and unchanged by the txWireRate flag.
+    // Legacy rate/count fields describe complete MGEN messages written during
+    // this window.  TCP stream progress is reported separately.
     report_msg_count = msg_count;
     report_rate_ave = (report_duration > 0.0) ?
                       ((double)byte_count / report_duration) : 0.0;
 
-    // Optional TCP wire-rate accounting reported ALONGSIDE (not instead of) the
-    // offered load: bytes actually transmitted onto the network this window.
-    // Left invalid (and unlogged) otherwise.
-    report_wire_valid = false;
-    report_wire_bytes = 0;
-    report_wire_rate_ave = 0.0;
-#ifdef LINUX
-    if (tx_wire_rate && (NULL != tx_socket) && tx_socket->IsConnected())
-    {
-        // Query the "not sent only" send-queue backlog (SIOCOUTQNSD): its
-        // per-window decrease reflects bytes actually put on the wire.  We do
-        // NOT use SIOCOUTQ here -- that is "not sent + not acked", so its
-        // decrease is ACK-clocked and, on high-RTT/bufferbloated links, lags
-        // real transmission (reporting 0 in windows where the wire was busy but
-        // ACKs had not yet returned).  Fall back to SIOCOUTQ on older headers.
-#ifdef SIOCOUTQNSD
-        const int txQueueQuery = SIOCOUTQNSD;
-#else
-        const int txQueueQuery = SIOCOUTQ;
-#endif
-        int q = 0;
-        if (0 == ioctl(tx_socket->GetHandle(), txQueueQuery, &q))
-        {
-            unsigned long queue_now = (unsigned long)q;
-            long queue_delta = (long)queue_now - (long)tx_queue_prev;
-            unsigned long transmitted =
-                ComputeDrainedBytes(tx_written_total - tx_written_prev, queue_delta);
-            report_wire_bytes = transmitted;
-            report_wire_rate_ave = (report_duration > 0.0) ?
-                                   ((double)transmitted / report_duration) : 0.0;
-            report_wire_valid = true;
-            tx_written_prev = tx_written_total;
-            tx_queue_prev = queue_now;
-        }
-    }
-#endif // LINUX
+    FinalizeTcpStream(sampleTcpStream);
 
-    // Update the encoded report message (offered rate, matching legacy).
+    // Keep the encoded report message on the legacy complete-message metric.
     report_msg.SetWindowSize(report_duration);
     report_msg.SetRateAve(report_rate_ave);
 
@@ -371,7 +478,7 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
     return false; 
 }  // end MgenAnalytic::Update()
 
-void MgenAnalytic::FinalizeRxWindow()
+void MgenAnalytic::FinalizeRxWindow(bool sampleTcpStream)
 {
     if (!window_valid)
         return;
@@ -380,6 +487,7 @@ void MgenAnalytic::FinalizeRxWindow()
     report_valid = true;
     report_start = window_start;
     report_duration = window_size;
+    FinalizeTcpStream(sampleTcpStream);
 
     UINT32 seqMax;
     if (!dup_mask.GetLastSet(seqMax))  // gets highest sequence number observed
@@ -483,9 +591,18 @@ void MgenAnalytic::Log(FILE*            filePtr,
     ProtoAddress dstAddr;
     report_msg.GetDstAddr(dstAddr);
     Mgen::Log(filePtr, "dst>%s/%hu ", dstAddr.GetHostString(), dstAddr.GetPort());
-    Mgen::Log(filePtr,"window>%lf rate>%lf kbps loss>%lf latency ave>%lf min>%lf max>%lf, count>%u\n",
+    Mgen::Log(filePtr,"window>%lf rate>%lf kbps loss>%lf latency ave>%lf min>%lf max>%lf, count>%u",
                 report_duration, report_rate_ave*8.0e-03, report_loss_ave, 
                 report_latency_ave, report_latency_min, report_latency_max, report_msg_count);
+    if (tcp_stream_enabled)
+    {
+        Mgen::Log(filePtr," tcpStreamValid>%u", report_tcp_stream_valid ? 1 : 0);
+        if (report_tcp_stream_valid)
+            Mgen::Log(filePtr," tcpStreamRate>%lf kbps tcpStreamBytes>%llu",
+                      report_tcp_stream_rate_ave*8.0e-03,
+                      report_tcp_stream_bytes);
+    }
+    Mgen::Log(filePtr,"\n");
 }  // end void MgenAnalytic:::Log()
 
 const MgenAnalytic::Report& MgenAnalytic::GetReport(const ProtoTime& theTime)

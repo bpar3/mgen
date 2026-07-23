@@ -114,7 +114,7 @@ Mgen::Mgen(ProtoTimerMgr&         timerMgr,
   addr_type(ProtoAddress::IPv4), 
   analytic_window(MgenAnalytic::DEFAULT_WINDOW),
   tx_analytics(false), compute_analytics(false), report_analytics(false), window_quantize(true),
-  tx_wire_rate(false),
+  tcp_stream_analytics(false),
   get_position(NULL), get_position_data(NULL),
   log_file(NULL), log_binary(false), local_time(false), log_flush(false), 
   log_file_lock(false), log_tx(false), log_rx(true), log_open(false), log_empty(true),
@@ -1048,7 +1048,11 @@ void Mgen::RemoveTxAnalytic(Protocol                protocol,
 }  // end Mgen::RemoveTxAnalytic()
 
 
-void Mgen::UpdateSendAnalytics(const struct timeval& tx_time, unsigned int msg_len, MgenMsg* theMsg, ProtoSocket* txSocket)
+void Mgen::UpdateSendAnalytics(const struct timeval& eventTime,
+                               unsigned int msg_len,
+                               MgenMsg* theMsg,
+                               ProtoSocket* txSocket,
+                               bool messageComplete)
 {
     if (!tx_analytics) return;
     if (NULL == theMsg) return;
@@ -1074,29 +1078,27 @@ void Mgen::UpdateSendAnalytics(const struct timeval& tx_time, unsigned int msg_l
             delete analytic;
             return;
         }
-        analytic->SetTxSocket(txSocket);
-        analytic->SetTxWireRate(tx_wire_rate);
-        // SIOCOUTQ is per-socket; if multiple flows share this socket, wire-rate
-        // accounting cannot be attributed per-flow, so disable it for them.
-        if (tx_wire_rate && (NULL != txSocket))
-            HandleTxWireRateSocketSharing(txSocket, analytic);
-    }
-    else
-    {
-        // The socket can change across TCP reconnects; keep the pointer current.
-        analytic->SetTxSocket(txSocket);
     }
 
-    // Count bytes handed to the socket (for wire-rate drain accounting) and
-    // accumulate into the current window.  The periodic analytic timer emits
-    // the TXREPORT for each elapsed window via FinalizeTxWindow()/TxLog().
-    analytic->AddTxWrittenBytes(msg_len);
-    analytic->TxUpdate(msg_len, ProtoTime(tx_time), theMsg->GetSeqNum());
+    analytic->SetTcpStream(txSocket, true,
+                           tcp_stream_analytics && TCP == theMsg->GetProtocol());
+    if (tcp_stream_analytics && NULL != txSocket)
+        DisableSharedTcpStream(tx_analytic_table, *analytic, txSocket);
+    ProtoTime updateTime(eventTime);
+    FlushTxAnalytic(*analytic, updateTime);
+    if (messageComplete)
+        analytic->TxUpdate(msg_len, updateTime, theMsg->GetSeqNum());
+    else
+        analytic->AddTcpStreamIoBytes(msg_len, updateTime);
 
     ActivateAnalyticTimer();
 }  // end Mgen::UpdateSendAnalytics()
 
-void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protocol theProtocol)
+void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime,
+                               MgenMsg* theMsg,
+                               Protocol theProtocol,
+                               unsigned int msgLen,
+                               ProtoSocket* rxSocket)
 {
     if (!compute_analytics) return;
     if (NULL == theMsg) return; // TBD - support timeout driven update
@@ -1122,13 +1124,54 @@ void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime, MgenMsg* theMsg, Protoc
         }
     }
 
-    // Accumulate into the current window.  The periodic analytic timer emits
-    // the REPORT (and queues analytic feedback / GUI updates) for each elapsed
-    // window via FinalizeRxWindow().
-    analytic->Update(theTime, theMsg->GetMsgLen(), ProtoTime(theMsg->GetTxTime()), theMsg->GetSeqNum());
+    analytic->SetTcpStream(rxSocket, false,
+                           tcp_stream_analytics && TCP == theProtocol);
+    if (checksum_force || theMsg->FlagIsSet(MgenMsg::CHECKSUM))
+        analytic->DisableTcpStreamAttribution();
+    if (tcp_stream_analytics && NULL != rxSocket)
+        DisableSharedTcpStream(analytic_table, *analytic, rxSocket);
+    FlushRxAnalytic(*analytic, theTime);
+    unsigned int completedLen = (0 != msgLen) ? msgLen : theMsg->GetMsgLen();
+    analytic->Update(theTime, completedLen, ProtoTime(theMsg->GetTxTime()), theMsg->GetSeqNum());
 
     ActivateAnalyticTimer();
 }  // end Mgen::UpdateRecvAnalytics()
+
+void Mgen::UpdateRecvStreamAnalytics(const ProtoTime& theTime,
+                                     MgenMsg* theMsg,
+                                     ProtoSocket* rxSocket,
+                                     unsigned long long byteCount)
+{
+    if (!compute_analytics || !tcp_stream_analytics || NULL == theMsg || NULL == rxSocket)
+        return;
+
+    MgenAnalytic* analytic = analytic_table.FindFlow(theMsg->GetSrcAddr(),
+                                                      theMsg->GetDstAddr(),
+                                                      theMsg->GetFlowId());
+    bool created = false;
+    if (NULL == analytic)
+    {
+        analytic = new MgenAnalytic();
+        if (NULL == analytic ||
+            !analytic->Init(TCP, theMsg->GetSrcAddr(), theMsg->GetDstAddr(),
+                            theMsg->GetFlowId(), window_quantize, analytic_window) ||
+            !analytic_table.Insert(*analytic))
+        {
+            PLOG(PL_ERROR, "Mgen::UpdateRecvStreamAnalytics() unable to create analytic: %s\n", GetErrorString());
+            delete analytic;
+            return;
+        }
+        created = true;
+    }
+
+    analytic->SetTcpStream(rxSocket, false, true, created);
+    if (checksum_force || theMsg->FlagIsSet(MgenMsg::CHECKSUM))
+        analytic->DisableTcpStreamAttribution();
+    DisableSharedTcpStream(analytic_table, *analytic, rxSocket);
+    FlushRxAnalytic(*analytic, theTime);
+    analytic->AddTcpStreamIoBytes(byteCount, theTime);
+    ActivateAnalyticTimer();
+}
 
 void Mgen::ActivateAnalyticTimer()
 {
@@ -1155,37 +1198,13 @@ bool Mgen::OnAnalyticTimeout(ProtoTimer& theTimer)
     MgenAnalyticTable::Iterator txIterator(tx_analytic_table);
     MgenAnalytic* analytic;
     while (NULL != (analytic = txIterator.GetNextItem()))
-    {
-        while (analytic->WindowElapsed(now))
-        {
-            ProtoTime windowEnd = analytic->GetWindowEnd();
-            analytic->FinalizeTxWindow();
-            analytic->TxLog(log_file, windowEnd, local_time);
-        }
-    }
+        FlushTxAnalytic(*analytic, now);
 
     // RX: emit a REPORT (timestamped at window_end) for every elapsed window and
     // queue analytic feedback / GUI updates, mirroring the former event path.
     MgenAnalyticTable::Iterator rxIterator(analytic_table);
     while (NULL != (analytic = rxIterator.GetNextItem()))
-    {
-        while (analytic->WindowElapsed(now))
-        {
-            ProtoTime windowEnd = analytic->GetWindowEnd();
-            analytic->FinalizeRxWindow();
-            MgenFlow* nextFlow = flow_list.Head();
-            while (NULL != nextFlow)
-            {
-                if (nextFlow->GetReportAnalytics())
-                    nextFlow->UpdateAnalyticReport(*analytic);
-                nextFlow = flow_list.GetNext(nextFlow);
-            }
-            const MgenAnalytic::Report& report = analytic->GetReport(windowEnd);
-            if (NULL != controller)  // e.g., Mgendr GUI
-                controller->OnUpdateReport(windowEnd, report);
-            analytic->Log(log_file, windowEnd, windowEnd, local_time);
-        }
-    }
+        FlushRxAnalytic(*analytic, now);
 
     // Re-arm aligned to the next window boundary (self-correcting phase lock).
     double toBoundary = analytic_window - fmod(now.GetValue(), analytic_window);
@@ -1194,39 +1213,84 @@ bool Mgen::OnAnalyticTimeout(ProtoTimer& theTimer)
     return true;  // periodic repeat reschedules with the updated interval
 }  // end Mgen::OnAnalyticTimeout()
 
-void Mgen::HandleTxWireRateSocketSharing(ProtoSocket* socket, MgenAnalytic* newAnalytic)
+void Mgen::FlushTxAnalytic(MgenAnalytic& analytic, const ProtoTime& now)
+{
+    bool missedBoundary = analytic.WindowElapsed(now) &&
+        (now.GetValue() >= analytic.GetWindowEnd().GetValue() + analytic_window);
+    while (analytic.WindowElapsed(now))
+    {
+        ProtoTime windowEnd = analytic.GetWindowEnd();
+        analytic.FinalizeTxWindow(!missedBoundary);
+        analytic.TxLog(log_file, windowEnd, local_time);
+    }
+}  // end Mgen::FlushTxAnalytic()
+
+void Mgen::FlushRxAnalytic(MgenAnalytic& analytic, const ProtoTime& now)
+{
+    bool missedBoundary = analytic.WindowElapsed(now) &&
+        (now.GetValue() >= analytic.GetWindowEnd().GetValue() + analytic_window);
+    while (analytic.WindowElapsed(now))
+    {
+        ProtoTime windowEnd = analytic.GetWindowEnd();
+        analytic.FinalizeRxWindow(!missedBoundary);
+        MgenFlow* nextFlow = flow_list.Head();
+        while (NULL != nextFlow)
+        {
+            if (nextFlow->GetReportAnalytics())
+                nextFlow->UpdateAnalyticReport(analytic);
+            nextFlow = flow_list.GetNext(nextFlow);
+        }
+        const MgenAnalytic::Report& report = analytic.GetReport(windowEnd);
+        if (NULL != controller)
+            controller->OnUpdateReport(windowEnd, report);
+        analytic.Log(log_file, windowEnd, windowEnd, local_time);
+    }
+}  // end Mgen::FlushRxAnalytic()
+
+void Mgen::ClearTcpAnalyticSocket(ProtoSocket* socket)
 {
     if (NULL == socket) return;
-    unsigned int count = 0;
-    MgenAnalyticTable::Iterator it(tx_analytic_table);
+    MgenAnalyticTable::Iterator txIt(tx_analytic_table);
     MgenAnalytic* a = NULL;
-    while (NULL != (a = it.GetNextItem()))
+    while (NULL != (a = txIt.GetNextItem()))
     {
-        if (a == newAnalytic) continue;
-        if (a->GetTxSocket() == socket)
+        if (a->GetTcpStreamSocket() == socket)
+            a->ClearTcpStreamSocket();
+    }
+    MgenAnalyticTable::Iterator rxIt(analytic_table);
+    while (NULL != (a = rxIt.GetNextItem()))
+    {
+        if (a->GetTcpStreamSocket() == socket)
+            a->ClearTcpStreamSocket();
+    }
+}  // end Mgen::ClearTcpAnalyticSocket()
+
+void Mgen::DisableRecvTcpStreamAttribution(ProtoSocket* socket)
+{
+    MgenAnalyticTable::Iterator iterator(analytic_table);
+    MgenAnalytic* analytic = NULL;
+    while (NULL != (analytic = iterator.GetNextItem()))
+    {
+        if (analytic->GetTcpStreamSocket() == socket)
+            analytic->DisableTcpStreamAttribution();
+    }
+}  // end Mgen::DisableRecvTcpStreamAttribution()
+
+void Mgen::DisableSharedTcpStream(MgenAnalyticTable& table,
+                                  MgenAnalytic& analytic,
+                                  ProtoSocket* socket)
+{
+    MgenAnalyticTable::Iterator iterator(table);
+    MgenAnalytic* other = NULL;
+    while (NULL != (other = iterator.GetNextItem()))
+    {
+        if (other != &analytic && other->GetTcpStreamSocket() == socket)
         {
-            count++;
-            a->SetTxWireRate(false);
+            other->DisableTcpStreamAttribution();
+            analytic.DisableTcpStreamAttribution();
         }
     }
-    if (count > 0)
-    {
-        newAnalytic->SetTxWireRate(false);
-        PLOG(PL_WARN, "Mgen::UpdateSendAnalytics() txWireRate enabled, but multiple flows share the same socket; reverting to offered-load accounting for those flows.\n");
-    }
-}  // end Mgen::HandleTxWireRateSocketSharing()
-
-void Mgen::ClearTxAnalyticSocket(ProtoSocket* socket)
-{
-    if (NULL == socket) return;
-    MgenAnalyticTable::Iterator it(tx_analytic_table);
-    MgenAnalytic* a = NULL;
-    while (NULL != (a = it.GetNextItem()))
-    {
-        if (a->GetTxSocket() == socket)
-            a->ClearTxSocket();
-    }
-}  // end Mgen::ClearTxAnalyticSocket()
+}  // end Mgen::DisableSharedTcpStream()
 
 
 /**
@@ -1612,7 +1676,7 @@ const StringMapper Mgen::COMMAND_LIST[] =
     {"+RECONNECT",  RECONNECT},
     {"-EPOCHTIMESTAMP", EPOCH_TIMESTAMP},
     {"+QUANTIZEWINDOW", WINDOW_QUANTIZE},
-    {"+TXWIRERATE", TX_WIRE_RATE},
+    {"+TCPSTREAMANALYTICS", TCP_STREAM_ANALYTICS},
     {"+OFF",        INVALID_COMMAND},  // to deconflict "offset" from "off" event
     {NULL,          INVALID_COMMAND}   
 };
@@ -1636,10 +1700,10 @@ const char* Mgen::GetCmdName(Command cmd)
 Mgen::Command Mgen::GetCommandFromString(const char* string)
 {
     // Make comparison case-insensitive
-    char upperString[16];
+    char upperString[32];
    size_t len = strlen(string);
 
-    len = len < 16 ? len : 16;
+    len = len < 31 ? len : 31;
     
     for (unsigned int i = 0 ; i < len; i++)
         upperString[i] = toupper(string[i]);
@@ -2343,14 +2407,14 @@ bool Mgen::OnCommand(Mgen::Command cmd, const char* arg, bool override)
       SetWindowQuantize(windowQuantizeTmp);
       break;
     }
-    case TX_WIRE_RATE:
+    case TCP_STREAM_ANALYTICS:
     {
       if (!arg)
       {
-          DMSG(0, "Mgen::OnCommand() Error: missing argument to txWireRate\n");
+          DMSG(0, "Mgen::OnCommand() Error: missing argument to tcpStreamAnalytics\n");
           return false;
       }
-      bool txWireRateTmp;
+      bool tcpStreamAnalyticsTmp;
       // convert to upper case for case-insensitivity
       char temp[5];
       size_t len = strlen(arg);
@@ -2360,25 +2424,22 @@ bool Mgen::OnCommand(Mgen::Command cmd, const char* arg, bool override)
         temp[i] = toupper(arg[i]);
       temp[i] = '\0';
       if(!strncmp("ON", temp, len))
-          txWireRateTmp = true;
+          tcpStreamAnalyticsTmp = true;
       else if(!strncmp("OFF", temp, len))
-          txWireRateTmp = false;
+          tcpStreamAnalyticsTmp = false;
       else
       {
-          DMSG(0, "Mgen::OnCommand() Error: wrong argument to txWireRate: %s\n", arg);
+          DMSG(0, "Mgen::OnCommand() Error: wrong argument to tcpStreamAnalytics: %s\n", arg);
           return false;
       }
 #ifndef LINUX
-      // Wire-rate accounting relies on the Linux SIOCOUTQ ioctl.  On other
-      // platforms, warn and revert to offered-load (bursty) TXREPORT rates.
-      if (txWireRateTmp)
+      if (tcpStreamAnalyticsTmp)
       {
-          PLOG(PL_WARN, "Mgen::OnCommand() txWireRate unsupported on this platform "
-                        "(no SIOCOUTQ); ignoring - TCP TXREPORT will use offered-load accounting\n");
-          txWireRateTmp = false;
+          PLOG(PL_WARN, "Mgen::OnCommand() tcpStreamAnalytics unsupported on this platform; ignoring\n");
+          tcpStreamAnalyticsTmp = false;
       }
 #endif // !LINUX
-      SetTxWireRate(txWireRateTmp);
+      SetTcpStreamAnalytics(tcpStreamAnalyticsTmp);
       break;
     }
     case INVALID_COMMAND:

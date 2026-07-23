@@ -11,7 +11,7 @@
 
 #include <math.h>  // for fabs()
 
-class ProtoSocket;  // forward decl (for TX wire-rate socket query)
+class ProtoSocket;  // forward declaration for TCP stream queue sampling
 
 // MGEN_DATA analytic report format
 // 
@@ -133,8 +133,8 @@ class MgenAnalytic : public ProtoQueue::Item
         // Finalize the current window into the "report_*" results (and the
         // report_msg buffer), then reset counts and advance the window by
         // one window_size.  Called once per elapsed window by the timer.
-        void FinalizeTxWindow();  // transmit-side (rate/count [+ wire rate])
-        void FinalizeRxWindow();  // receive-side (rate/count/loss/latency)
+        void FinalizeTxWindow(bool sampleTcpStream = true);
+        void FinalizeRxWindow(bool sampleTcpStream = true);
 
         // True when the current window has fully elapsed as of "now"
         bool WindowElapsed(const ProtoTime& now) const
@@ -142,30 +142,30 @@ class MgenAnalytic : public ProtoQueue::Item
         bool HasWindow() const
             {return window_valid;}
 
-        // TX wire-rate accounting (see FinalizeTxWindow())
-        void SetTxSocket(ProtoSocket* theSocket)
-            {tx_socket = theSocket;}
-        void ClearTxSocket()
-            {tx_socket = NULL;}
-        ProtoSocket* GetTxSocket() const
-            {return tx_socket;}
-        void SetTxWireRate(bool state)
-            {tx_wire_rate = state;}
+        // TCP stream accounting is separate from complete-message analytics.
+        // TX counts successful socket writes and samples SIOCOUTQNSD; RX counts
+        // successful reads and samples SIOCINQ.
+        void SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
+                          bool includeQueuedBytes = false);
+        void ClearTcpStreamSocket();
+        void DisableTcpStreamAttribution()
+            {tcp_stream_attributable = false;}
+        ProtoSocket* GetTcpStreamSocket() const
+            {return tcp_stream_socket;}
+        void AddTcpStreamIoBytes(unsigned long long byteCount,
+                                 const ProtoTime& eventTime);
 
-        // Accumulate number of bytes written into the socket send buffer.
-        void AddTxWrittenBytes(unsigned long byteCount)
-            {tx_written_total += byteCount;}
-
-        // Bytes that left the tracked send-queue during a window = bytes newly
-        // written into the send buffer minus the change in queue occupancy
-        // (queueDelta = queueNow - queuePrev).  Clamped at zero.  With the
-        // "not sent only" queue (SIOCOUTQNSD) this is bytes transmitted onto the
-        // wire.  Exposed as a static pure function so the arithmetic is testable.
-        static unsigned long ComputeDrainedBytes(unsigned long writtenDelta,
-                                                 long          queueDelta)
+        static unsigned long long ComputeTxStreamBytes(unsigned long long ioDelta,
+                                                       long long queueDelta)
         {
-            long drained = (long)writtenDelta - queueDelta;
-            return (drained > 0) ? (unsigned long)drained : 0;
+            long long streamBytes = (long long)ioDelta - queueDelta;
+            return (streamBytes > 0) ? (unsigned long long)streamBytes : 0;
+        }
+        static unsigned long long ComputeRxStreamBytes(unsigned long long ioDelta,
+                                                       long long queueDelta)
+        {
+            long long streamBytes = (long long)ioDelta + queueDelta;
+            return (streamBytes > 0) ? (unsigned long long)streamBytes : 0;
         }
 
         const Report& GetReport(const ProtoTime& theTime);
@@ -191,6 +191,12 @@ class MgenAnalytic : public ProtoQueue::Item
             {return report_latency_min;}
         double GetReportLatencyMax() const      // in seconds
             {return report_latency_max;}
+        bool GetReportTcpStreamValid() const
+            {return report_tcp_stream_valid;}
+        double GetReportTcpStreamRateAverage() const  // bytes/sec
+            {return report_tcp_stream_rate_ave;}
+        unsigned long long GetReportTcpStreamBytes() const
+            {return report_tcp_stream_bytes;}
         
         // Worst-case flow key length (in bytes):
         // IPv6 dstAddr + dstPort + IPv6 srcAddr + srcPort + flowId
@@ -418,6 +424,8 @@ class MgenAnalytic : public ProtoQueue::Item
             {return flow_keysize;}  
         
     private:
+        void FinalizeTcpStream(bool sampleTcpStream);
+
         char*               flow_key;
         unsigned int        flow_keysize;  // in bits
         
@@ -435,13 +443,17 @@ class MgenAnalytic : public ProtoQueue::Item
         double              latency_min;
         double              latency_max;
 
-        // TX wire-rate accounting (bytes actually drained from the kernel
-        // send buffer, sampled via SIOCOUTQ in FinalizeTxWindow()).
-        ProtoSocket*        tx_socket;         // NULL for UDP / when not tracking
-        bool                tx_wire_rate;      // report wire rate vs. offered load
-        unsigned long       tx_written_total;  // cumulative bytes handed to socket
-        unsigned long       tx_written_prev;   // snapshot at previous window boundary
-        unsigned long       tx_queue_prev;     // send-queue occupancy at prev boundary
+        // TCP stream accounting.  TX and RX analytics are separate objects, so
+        // each instance tracks one direction for one flow/socket.
+        ProtoSocket*        tcp_stream_socket;
+        bool                tcp_stream_enabled;
+        bool                tcp_stream_is_tx;
+        bool                tcp_stream_attributable;
+        bool                tcp_queue_initialized;
+        bool                tcp_window_sample_valid;
+        unsigned long long  tcp_io_total;
+        unsigned long long  tcp_io_prev;
+        unsigned long long  tcp_queue_prev;
 
         // Results of previous analytic
         bool                report_valid;
@@ -453,13 +465,9 @@ class MgenAnalytic : public ProtoQueue::Item
         double              report_latency_ave;
         double              report_latency_min;
         double              report_latency_max;
-        // Optional TX wire-rate results (only valid/logged when txWireRate is
-        // enabled and the send-queue could be sampled).  These are REPORTED
-        // ALONGSIDE the legacy offered-load report_rate_ave/report_msg_count,
-        // never in place of them.
-        bool                report_wire_valid;
-        double              report_wire_rate_ave;  // bytes/sec drained onto the wire
-        unsigned long       report_wire_bytes;     // bytes drained this window
+        bool                report_tcp_stream_valid;
+        double              report_tcp_stream_rate_ave;
+        unsigned long long  report_tcp_stream_bytes;
         ProtoTime           report_time;
         UINT32              report_buffer[Report::MAX_LENGTH/sizeof(UINT32)];
         Report              report_msg;

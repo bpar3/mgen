@@ -530,9 +530,7 @@ MgenSocketTransport::MgenSocketTransport(Mgen& theMgen,
 
 MgenSocketTransport::~MgenSocketTransport()
 {
-    // Drop any TX analytic references to this soon-to-be-destroyed socket so
-    // the analytic timer's wire-rate query never dereferences a dangling ptr.
-    mgen.ClearTxAnalyticSocket(&socket);
+    mgen.ClearTcpAnalyticSocket(&socket);
 }
 void MgenSocketTransport::SetEventOptions(const MgenEvent* event)
 {              
@@ -780,6 +778,7 @@ void MgenSocketTransport::Close()
         {
             StopOutputNotification(); 
             StopInputNotification();
+            mgen.ClearTcpAnalyticSocket(&socket);
             socket.Close();
         }
     }
@@ -1060,8 +1059,7 @@ MessageStatus MgenUdpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
       }
 
     LogEvent(SEND_EVENT, &theMsg,theMsg.GetTxTime(), txBuffer);
-    // UDP: no wire-rate accounting (offered==transmitted), so we
-    // pass a NULL socket here.
+    // UDP has no TCP stream accounting, so pass a NULL socket.
     mgen.UpdateSendAnalytics(theMsg.GetTxTime(), theMsg.GetMgenMsgLen(), &theMsg, NULL);
     return MSG_SEND_OK;
 
@@ -1086,7 +1084,10 @@ MgenTcpTransport::MgenTcpTransport(Mgen& theMgen,
     tx_msg_offset(0),tx_fragment_pending(0),tx_checksum(0),
     rx_msg(), rx_buffer_index(0),
     rx_fragment_pending(0),rx_msg_index(0),
-    rx_checksum(0),
+    rx_checksum(0), rx_stream_msg(), rx_stream_bound(false),
+    rx_stream_pending(0), rx_logical_msg_len(0),
+    rx_logical_seq_num(0), rx_logical_msg_pending(false),
+    rx_logical_msg_discard(false),
     retry_count(theMgen.GetDefaultRetryCount()),
     retry_delay(theMgen.GetDefaultRetryDelay())
 {
@@ -1168,14 +1169,24 @@ void MgenTcpTransport::OnEvent(ProtoSocket& theSocket,ProtoSocket::Event theEven
           while (1)
           {
               unsigned int numBytes = tx_buffer_pending; 
+              struct timeval writeTime;
+              ProtoSystemTime(writeTime);
+              if (numBytes > 0)
+                  mgen.UpdateSendAnalytics(writeTime, 0, &tx_msg, &socket, false);
               if (theSocket.Send(((char*)tx_msg_buffer) + tx_buffer_index, numBytes))
               {
                   // if we had an error, let socket notification
                   // tell us when to try again.
-                  if (tx_buffer_pending != 0 && numBytes == 0) 
+                  if (tx_buffer_pending != 0 && numBytes == 0)
                   {
                       StartOutputNotification(); 
                       return;
+                  }
+
+                  if (numBytes > 0)
+                  {
+                      mgen.UpdateSendAnalytics(writeTime, numBytes, &tx_msg,
+                                               &socket, false);
                   }
 
                   // Get next buffer to send, if all done, send any pending
@@ -1204,11 +1215,25 @@ void MgenTcpTransport::OnEvent(ProtoSocket& theSocket,ProtoSocket::Event theEven
 
               unsigned int bufferIndex = ((TX_BUFFER_SIZE + rx_msg_index) % TX_BUFFER_SIZE);
               unsigned int numBytes = GetRxNumBytes(bufferIndex);
-	          UINT32 buffer[TX_BUFFER_SIZE/4 + 1];
+              UINT32 buffer[TX_BUFFER_SIZE/4 + 1];
+              struct timeval readTime;
+              ProtoSystemTime(readTime);
+              bool streamReady = rx_stream_bound && (0 != rx_msg.GetFlowId()) &&
+                  !mgen.GetChecksumForce() &&
+                  !rx_msg.FlagIsSet(MgenMsg::CHECKSUM);
+              if (streamReady)
+                  mgen.UpdateRecvStreamAnalytics(ProtoTime(readTime), &rx_stream_msg,
+                                                  &socket, 0);
               if (IsConnected() && numBytes && theSocket.Recv(((char*)buffer)+bufferIndex, numBytes))
               {
                   if (0 != numBytes)
                   {
+                    if (streamReady)
+                        mgen.UpdateRecvStreamAnalytics(ProtoTime(readTime),
+                                                       &rx_stream_msg, &socket,
+                                                       numBytes);
+                    else
+                        rx_stream_pending += numBytes;
                     OnRecvMsg(numBytes, bufferIndex, buffer);
                   }
                   else
@@ -1345,6 +1370,10 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
     while (1)
     {
         unsigned int numBytes = tx_buffer_pending;   
+        struct timeval writeTime;
+        ProtoSystemTime(writeTime);
+        if (numBytes > 0)
+            mgen.UpdateSendAnalytics(writeTime, 0, &tx_msg, &socket, false);
         if (socket.IsConnected()
             &&
             socket.Send(((char*)tx_msg_buffer)+tx_buffer_index,numBytes))
@@ -1355,6 +1384,12 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
             {
                 StartOutputNotification();
                 return MSG_SEND_BLOCKED;
+            }
+
+            if (numBytes > 0)
+            {
+                mgen.UpdateSendAnalytics(writeTime, numBytes, &tx_msg,
+                                         &socket, false);
             }
             
             // Otherwise keep track of what we've sent
@@ -1399,7 +1434,10 @@ MessageStatus MgenTcpTransport::SendMessage(MgenMsg& theMsg, const ProtoAddress&
                 // transmitted.  Use the length of the entire mgen message
                 // (mgen_msg_len survives fragmentation) and the TX time of the
                 // first fragment sent.
-                mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg, &socket);
+                struct timeval completionTime;
+                ProtoSystemTime(completionTime);
+                mgen.UpdateSendAnalytics(completionTime, tx_msg.GetMgenMsgLen(),
+                                         &tx_msg, &socket, true);
                 ResetTxMsgState();
                 StopOutputNotification(); // ljt 0516 - check if we need this?
                 // we may still have pending stuff!
@@ -1575,6 +1613,12 @@ void MgenTcpTransport::CalcRxChecksum(const char* buffer,unsigned int bufferInde
 
 bool MgenTcpTransport::Reconnect(ProtoAddress::Type addrType)
 {
+    mgen.ClearTcpAnalyticSocket(&socket);
+    rx_stream_bound = false;
+    rx_stream_pending = 0;
+    rx_logical_msg_len = 0;
+    rx_logical_msg_pending = false;
+    rx_logical_msg_discard = false;
     if (socket.IsOpen())
     {
         if (IsClient())
@@ -1614,6 +1658,11 @@ bool MgenTcpTransport::Open(ProtoAddress::Type addrType, bool bindOnOpen)
     }
     if (MgenSocketTransport::Open(addrType,bindOnOpen))
     {
+        rx_stream_bound = false;
+        rx_stream_pending = 0;
+        rx_logical_msg_len = 0;
+        rx_logical_msg_pending = false;
+        rx_logical_msg_discard = false;
         if (IsClient())
         {
             if (!socket.Connect(dstAddress))
@@ -1677,6 +1726,11 @@ bool MgenTcpTransport::Accept(ProtoSocket& theSocket)
         reference_count++; 
         SetDstAddr(socket.GetDestination()); 
         IsClient(false);
+        rx_stream_bound = false;
+        rx_stream_pending = 0;
+        rx_logical_msg_len = 0;
+        rx_logical_msg_pending = false;
+        rx_logical_msg_discard = false;
         // Set listener for the new socket
         socket.SetListener(this,&MgenTcpTransport::OnEvent);
         // Get srcAddr for logging 
@@ -1703,6 +1757,22 @@ unsigned int MgenTcpTransport::GetRxNumBytes(unsigned int bufferIndex)
     {
         // attempt to get what's left
         numBytes = rx_msg.GetMsgLen() - rx_msg_index;
+        if (0 == rx_msg.GetFlowId())
+        {
+            unsigned int headerBytes = 24;
+            if (rx_msg_index >= headerBytes)
+            {
+                const UINT8* header = (const UINT8*)rx_msg_buffer;
+                UINT8 addrLen = header[23];
+                if (((MgenMsg::IPv4 == header[22]) && (4 == addrLen)) ||
+                    ((MgenMsg::IPv6 == header[22]) && (16 == addrLen)))
+                    headerBytes += addrLen;
+                else
+                    headerBytes = rx_msg.GetMsgLen();
+            }
+            if (rx_msg_index < headerBytes && numBytes > (headerBytes - rx_msg_index))
+                numBytes = headerBytes - rx_msg_index;
+        }
         
         // Trim attempted read size to our buffer limit
 	if (numBytes > (TX_BUFFER_SIZE - bufferIndex))
@@ -1719,6 +1789,33 @@ void MgenTcpTransport::OnRecvMsg(unsigned int numBytes, unsigned int bufferIndex
     // This unpacks the message into rx_msg if we 
     // have recevied the mgen msg header...
     CopyMsgBuffer(numBytes, bufferIndex, (char*)buffer);
+
+    bool checksumPending = mgen.GetChecksumForce() ||
+                           rx_msg.FlagIsSet(MgenMsg::CHECKSUM);
+    if (checksumPending)
+    {
+        mgen.DisableRecvTcpStreamAttribution(&socket);
+        rx_stream_pending = 0;
+    }
+    if (0 != rx_msg.GetFlowId() && !checksumPending)
+    {
+        if (!rx_msg.GetDstAddr().IsValid())
+            rx_msg.SetDstAddr(dstAddress);
+        if (!rx_stream_bound ||
+            rx_stream_msg.GetFlowId() != rx_msg.GetFlowId())
+        {
+            rx_stream_msg = rx_msg;
+            rx_stream_bound = true;
+        }
+        if (rx_stream_pending > 0)
+        {
+            struct timeval streamTime;
+            ProtoSystemTime(streamTime);
+            mgen.UpdateRecvStreamAnalytics(ProtoTime(streamTime), &rx_stream_msg,
+                                           &socket, rx_stream_pending);
+            rx_stream_pending = 0;
+        }
+    }
     
     // Get the message size if we haven't already
     if ((0 == rx_msg.GetMsgLen()) && (rx_msg_index >= MSG_LEN_SIZE))
@@ -1747,14 +1844,66 @@ void MgenTcpTransport::OnRecvMsg(unsigned int numBytes, unsigned int bufferIndex
         {
             if (!rx_msg.GetDstAddr().IsValid())
                 rx_msg.SetDstAddr(dstAddress);
+            if (!rx_stream_bound)
+            {
+                rx_stream_msg = rx_msg;
+                rx_stream_bound = true;
+            }
+            if (rx_stream_pending > 0)
+            {
+                mgen.UpdateRecvStreamAnalytics(ProtoTime(currentTime), &rx_stream_msg,
+                                               &socket, rx_stream_pending);
+                rx_stream_pending = 0;
+            }
             ProcessRecvMessage(rx_msg, ProtoTime(currentTime));
             if (mgen.ComputeAnalytics())
-                mgen.UpdateRecvAnalytics(currentTime, &rx_msg, TCP);
+            {
+                if (rx_msg.FlagIsSet(MgenMsg::CONTINUES))
+                {
+                    if (!rx_logical_msg_discard && (!rx_logical_msg_pending ||
+                        rx_logical_seq_num != rx_msg.GetSeqNum()))
+                    {
+                        rx_logical_msg_len = 0;
+                        rx_logical_seq_num = rx_msg.GetSeqNum();
+                        rx_logical_msg_pending = true;
+                    }
+                    if (!rx_logical_msg_discard)
+                        rx_logical_msg_len += rx_msg.GetMsgLen();
+                }
+                else if (rx_msg.FlagIsSet(MgenMsg::END_OF_MSG))
+                {
+                    if (!rx_logical_msg_discard)
+                    {
+                        unsigned int completedLen = rx_msg.GetMsgLen();
+                        if (rx_logical_msg_pending &&
+                            rx_logical_seq_num == rx_msg.GetSeqNum())
+                            completedLen += rx_logical_msg_len;
+                        mgen.UpdateRecvAnalytics(ProtoTime(currentTime), &rx_msg, TCP,
+                                                 completedLen, &socket);
+                    }
+                    rx_logical_msg_len = 0;
+                    rx_logical_msg_pending = false;
+                    rx_logical_msg_discard = false;
+                }
+                else
+                {
+                    mgen.UpdateRecvAnalytics(ProtoTime(currentTime), &rx_msg, TCP,
+                                             rx_msg.GetMsgLen(), &socket);
+                    rx_logical_msg_len = 0;
+                    rx_logical_msg_pending = false;
+                    rx_logical_msg_discard = false;
+                }
+            }
             if (mgen.GetLogFile())
                 LogEvent(RECV_EVENT, &rx_msg, currentTime, rx_msg_buffer);
         }
         else
         {
+            rx_stream_pending = 0;
+            rx_logical_msg_len = 0;
+            rx_logical_msg_pending = false;
+            rx_logical_seq_num = rx_msg.GetSeqNum();
+            rx_logical_msg_discard = true;
             if (mgen.GetLogFile())
                 LogEvent(RERR_EVENT, &rx_msg, currentTime);
         } 
@@ -1817,7 +1966,10 @@ bool MgenTcpTransport::GetNextTxBuffer(unsigned int numBytes)
             // transmitted via the asynchronous (socket-notification) send path.
             // tx_msg.GetMsgLen() has been zeroed by fragmentation here, so use
             // mgen_msg_len (the full message length) and the first-fragment TX time.
-            mgen.UpdateSendAnalytics(tx_time, tx_msg.GetMgenMsgLen(), &tx_msg, &socket);
+            struct timeval completionTime;
+            ProtoSystemTime(completionTime);
+            mgen.UpdateSendAnalytics(completionTime, tx_msg.GetMgenMsgLen(),
+                                     &tx_msg, &socket, true);
             ResetTxMsgState();
             return false;
         }
@@ -2028,11 +2180,21 @@ void MgenTcpTransport::CopyMsgBuffer(unsigned int numBytes,unsigned int bufferIn
     
     // This could be cleaned up a bit!
     
-    if ((((rx_msg.GetMsgLen() - rx_fragment_pending) < TX_BUFFER_SIZE)
-         && (rx_msg_index >= TX_BUFFER_SIZE))
-        ||
-        ((rx_msg.GetMsgLen() == rx_msg_index) 
-         && (rx_msg_index <= TX_BUFFER_SIZE)))
+    if (0 == rx_msg.GetFlowId() && rx_msg_index >= 24)
+    {
+        const UINT8* header = (const UINT8*)rx_msg_buffer;
+        UINT8 addrLen = header[23];
+        if ((((MgenMsg::IPv4 == header[22]) && (4 == addrLen)) ||
+             ((MgenMsg::IPv6 == header[22]) && (16 == addrLen))) &&
+            rx_msg_index >= (unsigned int)(24 + addrLen))
+            rx_msg.Unpack(rx_msg_buffer, 24 + addrLen,
+                          mgen.GetChecksumForce(), false);
+    }
+
+    if ((((rx_msg.GetMsgLen() - rx_fragment_pending) < TX_BUFFER_SIZE) &&
+         (rx_msg_index >= TX_BUFFER_SIZE)) ||
+        ((rx_msg.GetMsgLen() == rx_msg_index) &&
+         (rx_msg_index <= TX_BUFFER_SIZE)))
     {
         if (mgen.GetLogFile()) 
         {
@@ -2204,5 +2366,3 @@ void MgenTransport::ProcessRecvMessage(MgenMsg& msg, const ProtoTime& theTime)
         }
     }
 }  // end MgenTransport::ProcessRecvMessage()
-
-

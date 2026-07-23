@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 #
 # mgenAnalyticsTest.py - end-to-end tests for the MGEN analytics features added
-# on the analytics-tx-reports and tx-wire-rate branches:
+# on the analytics-tx-reports and tcp-stream-analytics branches:
 #
 #   * RX analytics  (analytics    -> REPORT log lines)
 #   * TX analytics  (txAnalytics  -> TXREPORT log lines)
 #   * quantizeWindow {on|off}     (analytics window-size quantization)
-#   * txWireRate {on|off}         (TCP wire-rate accounting via SIOCOUTQ)
+#   * tcpStreamAnalytics {on|off} (symmetric TCP byte-stream accounting)
 #   * timer-driven, whole-second-aligned reporting with no drift
 #
 # Unlike the older src/python scripts (Python 2, protokit control pipe,
@@ -50,13 +50,13 @@ class Report(object):
         self.lat_ave = _to_float(fields.get("ave"))     # REPORT only
         self.lat_min = _to_float(fields.get("min"))     # REPORT only
         self.lat_max = _to_float(fields.get("max"))     # REPORT only
-        # TXREPORT wire-rate fields (present only when txWireRate is enabled)
-        self.wire_rate  = _to_float(fields.get("wireRate"))    # kbps drained
-        self.wire_bytes = _to_float(fields.get("wireBytes"))   # bytes drained
+        self.stream_valid = fields.get("tcpStreamValid") == "1"
+        self.stream_rate  = _to_float(fields.get("tcpStreamRate"))
+        self.stream_bytes = _to_float(fields.get("tcpStreamBytes"))
 
     @property
     def bytes_est(self):
-        # bytes implied by the (offered-load) rate over a "window"-second window
+        # Bytes implied by complete-message rate over a window.
         if self.rate is None or self.window is None:
             return 0.0
         return self.rate * 1000.0 / 8.0 * self.window
@@ -380,87 +380,101 @@ def scenario_quantize_window(chk, mgen, duration):
                  "window 2.0 + quantize off: RX window == 2.000000 (honored, not quantized)")
 
 
-def scenario_tx_wire_rate(chk, mgen, duration):
-    """txWireRate on a TCP loopback flow.  The legacy rate>/count> fields must
-    ALWAYS report the offered load and stay self-consistent; the wireRate>/
-    wireBytes> fields must appear only when txWireRate is on and accurately
-    track the bytes actually delivered (== received, on a non-saturating link)."""
-    chk.scenario("txWireRate: legacy offered rate/count preserved + wire fields")
+def scenario_tcp_stream_rate(chk, mgen, duration):
+    """TCP stream analytics are emitted symmetrically for TX and RX while
+    legacy rate/count continue to represent complete MGEN messages."""
+    chk.scenario("tcpStreamAnalytics: TX/RX stream fields + message metrics")
     port = 5020
     rate_pps, size = 100, 1024
     ev_recv = ("event", "LISTEN TCP %d" % port)
     ev_send = ("event", "ON 1 TCP DST 127.0.0.1/%d PERIODIC [%d %d]" % (port, rate_pps, size))
 
-    for wire in ("on", "off"):
+    for stream in ("on", "off"):
         recv, send = mgen.run_pair(
-            recv_args=["analytics", "quantizeWindow", "off", ev_recv[0], ev_recv[1]],
-            send_args=["txAnalytics", "txWireRate", wire, "quantizeWindow", "off",
+            recv_args=["analytics", "tcpStreamAnalytics", stream,
+                       "quantizeWindow", "off", ev_recv[0], ev_recv[1]],
+            send_args=["txAnalytics", "tcpStreamAnalytics", stream,
+                       "quantizeWindow", "off",
                        ev_send[0], ev_send[1]],
-            duration=duration, stop_flows=[1], tag="tcp-%s" % wire)
+            duration=duration, stop_flows=[1], tag="tcp-%s" % stream)
         rx = by_flow(parse_reports(recv), "REPORT").get(1, [])
         tx = by_flow(parse_reports(send), "TXREPORT").get(1, [])
 
-        assert_cadence(chk, rx, 1.0, "TCP RX REPORT (wire %s)" % wire)
-        assert_cadence(chk, tx, 1.0, "TCP TX TXREPORT (wire %s)" % wire)
+        assert_cadence(chk, rx, 1.0, "TCP RX REPORT (stream %s)" % stream)
+        assert_cadence(chk, tx, 1.0, "TCP TX TXREPORT (stream %s)" % stream)
 
-        # Legacy rate/count ALWAYS = offered load and self-consistent, i.e.
+        # Legacy rate/count remain complete-message metrics and self-consistent.
         # rate(kbps) == count*size*8/1000/window (regardless of the wire flag).
         for r in nonempty(tx):
             expected = r.count * size * 8 / 1000.0 / r.window
             chk.near(r.rate, expected, max(1.0, expected * 0.02),
-                     "TCP wire %s: legacy rate==offered (count=%d -> %.1f kbps)"
-                     % (wire, r.count, expected))
+                      "TCP stream %s: rate==completed messages (count=%d -> %.1f kbps)"
+                      % (stream, r.count, expected))
 
         tx_count = total_count(tx)
         rx_count = total_count(rx)
-        chk.ge(tx_count, 1, "TCP wire %s: TX produced messages" % wire)
+        chk.ge(tx_count, 1, "TCP stream %s: TX produced messages" % stream)
         if tx_count:
             chk.between(rx_count, tx_count * 0.85, tx_count * 1.15,
-                        "TCP wire %s: RX count (%d) ~= TX count (%d)"
-                        % (wire, rx_count, tx_count))
+                        "TCP stream %s: RX count (%d) ~= TX count (%d)"
+                        % (stream, rx_count, tx_count))
 
-        # Wire fields present iff txWireRate is on.  They require a live socket
-        # to sample, so they appear on every active (count>0) window; trailing
-        # empty windows after the flow's OFF closes the socket legitimately omit
-        # them.
-        tx_wire = [r for r in tx if r.wire_rate is not None]
-        if wire == "on":
-            # Every mid-transfer active window carries wire fields.  The LAST
-            # active window can straddle the flow's OFF (socket closed before the
-            # timer samples SIOCOUTQ), so exclude it.
-            active = [r for r in tx if r.count > 0]
-            midxfer = active[:-1]
-            missing = [r for r in midxfer if r.wire_rate is None]
-            chk.check(bool(midxfer) and not missing,
-                      "wire ON: mid-transfer active TXREPORTs carry wireRate/wireBytes"
-                      " (%d checked, %d missing)" % (len(midxfer), len(missing)))
-            # Accuracy: over the windows it could sample, wireBytes matches the
-            # bytes offered in those same windows (== delivered on loopback).
-            # (Windows after OFF can't be sampled, so compare like-for-like.)
-            wire_valid = [r for r in tx if r.wire_rate is not None]
-            wb = sum(r.wire_bytes for r in wire_valid)
-            offered_sampled = sum(r.count for r in wire_valid) * size
-            chk.ge(wb, 1, "wire ON: measured some wire bytes")
-            chk.between(wb, offered_sampled * 0.90, offered_sampled * 1.10,
-                        "wire ON: wireBytes (%d) ~= offered bytes over sampled windows (%d)"
-                        % (int(wb), int(offered_sampled)))
+        if stream == "on":
+            tx_valid = [r for r in tx if r.stream_valid]
+            rx_valid = [r for r in rx if r.stream_valid]
+            chk.ge(len(tx_valid), 1, "stream ON: TX has valid stream windows")
+            chk.ge(len(rx_valid), 1, "stream ON: RX has valid stream windows")
+            tx_bytes = sum(r.stream_bytes for r in tx_valid)
+            rx_bytes = sum(r.stream_bytes for r in rx_valid)
+            chk.ge(tx_bytes, 1, "stream ON: measured TX stream bytes")
+            chk.ge(rx_bytes, 1, "stream ON: measured RX stream bytes")
+            chk.between(rx_bytes, tx_bytes * 0.80, tx_bytes * 1.20,
+                        "stream ON: RX bytes (%d) ~= TX bytes (%d)"
+                        % (int(rx_bytes), int(tx_bytes)))
         else:
-            chk.check(len(tx_wire) == 0,
-                      "wire OFF: no TXREPORT carries wire fields (legacy format)")
+            chk.check(not any(r.stream_valid for r in tx + rx),
+                      "stream OFF: no report carries stream fields")
+
+
+def scenario_tcp_unlimited(chk, mgen, duration):
+    """An unlimited TCP flow must not collapse active stream windows into an
+    aggregate spike followed by fabricated zero windows when timers run late."""
+    chk.scenario("TCP unlimited: active stream windows remain populated")
+    port = 5025
+    dur = min(duration, 4.0)
+    recv, send = mgen.run_pair(
+        recv_args=["analytics", "tcpStreamAnalytics", "on",
+                   "quantizeWindow", "off", "event", "LISTEN TCP %d" % port],
+        send_args=["txAnalytics", "tcpStreamAnalytics", "on",
+                   "quantizeWindow", "off", "event",
+                   "ON 1 TCP DST 127.0.0.1/%d PERIODIC [-1 1400]" % port],
+        duration=dur, stop_flows=[1], tag="tcp-unlimited")
+    rx = by_flow(parse_reports(recv), "REPORT").get(1, [])
+    tx = by_flow(parse_reports(send), "TXREPORT").get(1, [])
+    assert_cadence(chk, rx, 1.0, "unlimited TCP RX")
+    assert_cadence(chk, tx, 1.0, "unlimited TCP TX")
+    tx_active = [r for r in tx[1:-1] if r.stream_valid]
+    rx_active = [r for r in rx[1:-1] if r.stream_valid]
+    chk.ge(len(tx_active), 1, "unlimited TX has valid interior windows")
+    chk.ge(len(rx_active), 1, "unlimited RX has valid interior windows")
+    chk.check(all(r.stream_bytes > 0 for r in tx_active),
+              "unlimited TX valid interior windows are nonzero")
+    chk.check(all(r.stream_bytes > 0 for r in rx_active),
+              "unlimited RX valid interior windows are nonzero")
 
 
 def scenario_all_combined(chk, mgen, duration):
     """All features on together, with a UDP flow and a TCP flow in the SAME run,
-    to confirm the settings coexist: analytics + txAnalytics + txWireRate on +
+    to confirm the settings coexist: analytics + txAnalytics + tcpStreamAnalytics on +
     quantizeWindow off, both flows reported on a steady 1s whole-second grid."""
     chk.scenario("Combined: UDP(flow1) + TCP(flow2), all analytics features on")
     uport, tport = 5030, 5031
     rate_pps, size = 100, 1024
     recv, send = mgen.run_pair(
-        recv_args=["analytics", "quantizeWindow", "off",
+        recv_args=["analytics", "tcpStreamAnalytics", "on", "quantizeWindow", "off",
                    "event", "LISTEN UDP %d" % uport,
                    "event", "LISTEN TCP %d" % tport],
-        send_args=["txAnalytics", "txWireRate", "on", "quantizeWindow", "off",
+        send_args=["txAnalytics", "tcpStreamAnalytics", "on", "quantizeWindow", "off",
                    "event", "ON 1 UDP DST 127.0.0.1/%d PERIODIC [%d %d]" % (uport, rate_pps, size),
                    "event", "ON 2 TCP DST 127.0.0.1/%d PERIODIC [%d %d]" % (tport, rate_pps, size)],
         duration=duration, stop_flows=[1, 2], tag="combined")
@@ -514,7 +528,8 @@ def main():
     try:
         scenario_udp_analytics(chk, mgen, args.duration)
         scenario_quantize_window(chk, mgen, args.duration)
-        scenario_tx_wire_rate(chk, mgen, args.duration)
+        scenario_tcp_stream_rate(chk, mgen, args.duration)
+        scenario_tcp_unlimited(chk, mgen, args.duration)
         scenario_all_combined(chk, mgen, args.duration)
     finally:
         if args.keep:
