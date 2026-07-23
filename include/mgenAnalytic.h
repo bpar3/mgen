@@ -168,6 +168,20 @@ class MgenAnalytic : public ProtoQueue::Item
         };
         static const char* GetTcpStreamReasonString(TcpStreamReason reason);
 
+        // Test-only seam: when set, used instead of the real
+        // SIOCOUTQNSD/SIOCINQ ioctl() call to obtain the current queue
+        // depth for this direction.  Production code (the default, NULL)
+        // is unaffected; unit tests use this to deterministically drive
+        // queue values, failures, and inconsistencies without depending on
+        // real kernel timing over a live socket.  Returns false to
+        // simulate an ioctl() failure.
+        typedef bool (*TcpQueueQueryFunc)(void* userData, bool isTx, int& queueValue);
+        void SetTcpQueueQueryFuncForTest(TcpQueueQueryFunc func, void* userData = NULL)
+        {
+            tcp_queue_query_func = func;
+            tcp_queue_query_user_data = userData;
+        }
+
         // TCP stream accounting is separate from complete-message analytics.
         // TX counts successful socket writes and samples SIOCOUTQNSD; RX counts
         // successful reads and samples SIOCINQ.
@@ -464,6 +478,12 @@ class MgenAnalytic : public ProtoQueue::Item
         
     private:
         void FinalizeTcpStream(bool sampleTcpStream, const ProtoTime& sampleTime);
+        // Reads the current TCP queue depth for tcp_stream_socket in the
+        // configured direction, via tcp_queue_query_func if a test override
+        // is set, otherwise via the real SIOCOUTQNSD/SIOCINQ ioctl().
+        // Returns false on failure (ioctl error, or the override reports
+        // failure); "queueValue" is only valid when this returns true.
+        bool QueryTcpQueueBytes(int& queueValue) const;
 
         char*               flow_key;
         unsigned int        flow_keysize;  // in bits
@@ -512,6 +532,10 @@ class MgenAnalytic : public ProtoQueue::Item
         TcpStreamReason     tcp_stream_reason;
         UINT32              tcp_stream_sample_id;
         ProtoTime           tcp_stream_sample_time;
+
+        // Test-only queue-query override (see SetTcpQueueQueryFuncForTest()).
+        TcpQueueQueryFunc   tcp_queue_query_func;
+        void*               tcp_queue_query_user_data;
 
         // Results of previous analytic
         bool                report_valid;

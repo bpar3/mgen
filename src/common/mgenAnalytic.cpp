@@ -22,6 +22,7 @@ MgenAnalytic::MgenAnalytic()
    tcp_stream_generation(0), tcp_stream_next_sample_id(1),
    tcp_stream_total_bytes(0), tcp_stream_total_initialized(false),
    tcp_stream_reason(TCP_STREAM_UNSUPPORTED), tcp_stream_sample_id(0),
+   tcp_queue_query_func(NULL), tcp_queue_query_user_data(NULL),
    report_valid(false), report_msg_count(0),
    report_tcp_stream_valid(false), report_tcp_stream_rate_ave(0.0),
    report_tcp_stream_bytes(0), report_tcp_stream_reason(TCP_STREAM_UNSUPPORTED),
@@ -118,6 +119,18 @@ const char* MgenAnalytic::GetTcpStreamReasonString(TcpStreamReason reason)
     }
 }  // end MgenAnalytic::GetTcpStreamReasonString()
 
+bool MgenAnalytic::QueryTcpQueueBytes(int& queueValue) const
+{
+    if (NULL != tcp_queue_query_func)
+        return tcp_queue_query_func(tcp_queue_query_user_data, tcp_stream_is_tx, queueValue);
+#if defined(LINUX) && defined(SIOCOUTQNSD) && defined(SIOCINQ)
+    const int query = tcp_stream_is_tx ? SIOCOUTQNSD : SIOCINQ;
+    return (0 == ioctl(tcp_stream_socket->GetHandle(), query, &queueValue));
+#else
+    return false;
+#endif
+}  // end MgenAnalytic::QueryTcpQueueBytes()
+
 void MgenAnalytic::SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
                                 bool includeQueuedBytes)
 {
@@ -173,8 +186,7 @@ void MgenAnalytic::SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
         tcp_stream_socket->IsConnected())
     {
         int queueValue = 0;
-        const int query = tcp_stream_is_tx ? SIOCOUTQNSD : SIOCINQ;
-        if (0 == ioctl(tcp_stream_socket->GetHandle(), query, &queueValue))
+        if (QueryTcpQueueBytes(queueValue))
         {
             tcp_queue_prev = (unsigned long long)queueValue;
             tcp_io_prev = tcp_io_total;
@@ -394,8 +406,7 @@ void MgenAnalytic::FinalizeTcpStream(bool sampleTcpStream, const ProtoTime& samp
     }
 
     int queueValue = 0;
-    const int query = tcp_stream_is_tx ? SIOCOUTQNSD : SIOCINQ;
-    if (0 != ioctl(tcp_stream_socket->GetHandle(), query, &queueValue))
+    if (!QueryTcpQueueBytes(queueValue))
     {
         // Leave the prior successful snapshot (tcp_io_prev/tcp_queue_prev)
         // unchanged so successful application I/O keeps accumulating in
