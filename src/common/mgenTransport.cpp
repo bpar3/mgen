@@ -17,6 +17,10 @@
 #include <fcntl.h>
 #endif // UNIX
 
+// Definition for MgenDispatchBudget's test-only clock override (declared in
+// mgenGlobals.h); NULL leaves production code on the real monotonic clock.
+MgenDispatchBudget::ClockFunc MgenDispatchBudget::clock_func = NULL;
+
 MgenTransportList::MgenTransportList()
   :  head(NULL), tail(NULL)
 {

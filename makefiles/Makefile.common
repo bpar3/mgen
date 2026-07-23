@@ -100,9 +100,18 @@ ANALYTIC_TEST_OBJ = $(ANALYTIC_TEST_SRC:.cpp=.o)
 mgenAnalyticTest:	$(ANALYTIC_TEST_OBJ) $(MGEN_OBJ) $(LIBPROTO)
 		$(CC) -g $(CFLAGS) -o $@ $(ANALYTIC_TEST_OBJ) $(MGEN_OBJ) $(LDFLAGS) $(LIBPROTO) $(LIBS)
 
+# mgenDispatchBudgetTest is a standalone unit-test driver for
+# MgenDispatchBudget (TCP dispatch-loop fairness)
+DISPATCH_BUDGET_TEST_SRC = $(COMMON)/mgenDispatchBudgetTest.cpp
+DISPATCH_BUDGET_TEST_OBJ = $(DISPATCH_BUDGET_TEST_SRC:.cpp=.o)
+
+mgenDispatchBudgetTest:	$(DISPATCH_BUDGET_TEST_OBJ) $(MGEN_OBJ) $(LIBPROTO)
+		$(CC) -g $(CFLAGS) -o $@ $(DISPATCH_BUDGET_TEST_OBJ) $(MGEN_OBJ) $(LDFLAGS) $(LIBPROTO) $(LIBS)
+
 # Build and run the C++ unit tests
-check:	mgenAnalyticTest
+check:	mgenAnalyticTest mgenDispatchBudgetTest
 		./mgenAnalyticTest
+		./mgenDispatchBudgetTest
 
 # Build mgen and run the Python end-to-end analytics tests (needs python3)
 PYTHON3 ?= python3
@@ -113,7 +122,7 @@ check-e2e:	mgen
 check-all:	check check-e2e
 
 clean:
-	rm -f $(COMMON)/*.o  $(UNIX)/*.o $(UNIX)/mgen $(UNIX)/*.so $(UNIX)/mpmgr $(UNIX)/mgenAnalyticTest $(NS)/*.o;
+	rm -f $(COMMON)/*.o  $(UNIX)/*.o $(UNIX)/mgen $(UNIX)/*.so $(UNIX)/mpmgr $(UNIX)/mgenAnalyticTest $(UNIX)/mgenDispatchBudgetTest $(NS)/*.o;
 	$(MAKE) -C $(PROTOLIB)/makefiles -f Makefile.$(SYSTEM) clean
 distclean:  clean
 

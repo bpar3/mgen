@@ -3,6 +3,7 @@ makefiles/mgen
 makefiles/mpmgr
 makefiles/pcap2mgen
 makefiles/mgenAnalyticTest
+makefiles/mgenDispatchBudgetTest
 
 # python generated files
 build

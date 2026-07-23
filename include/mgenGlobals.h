@@ -145,6 +145,15 @@ inline double MgenMonotonicSeconds()
 class MgenDispatchBudget
 {
     public:
+        // Test-only seam: when set, used instead of MgenMonotonicSeconds()
+        // to obtain "now" for expiry checks.  This overrides the clock for
+        // ALL MgenDispatchBudget instances -- there is no per-instance
+        // state to distinguish, and production code constructs a fresh
+        // budget per dispatcher callback rather than holding one across
+        // calls.  NULL (the default) restores the real monotonic clock.
+        typedef double (*ClockFunc)();
+        static void SetClockFuncForTest(ClockFunc func) {clock_func = func;}
+
         MgenDispatchBudget()
           : active(false), op_count(0), op_limit(0), deadline(0.0) {}
 
@@ -153,7 +162,7 @@ class MgenDispatchBudget
             active = true;
             op_count = 0;
             op_limit = opLimit;
-            deadline = MgenMonotonicSeconds() + wallClockBudgetSeconds;
+            deadline = Now() + wallClockBudgetSeconds;
         }
 
         void RecordOp() {op_count++;}
@@ -162,14 +171,20 @@ class MgenDispatchBudget
         {
             if (!active) return false;
             if ((op_limit > 0) && (op_count >= op_limit)) return true;
-            return MgenMonotonicSeconds() >= deadline;
+            return Now() >= deadline;
         }
 
     private:
+        static double Now()
+        {
+            return (NULL != clock_func) ? clock_func() : MgenMonotonicSeconds();
+        }
+
         bool          active;
         unsigned int  op_count;
         unsigned int  op_limit;
         double        deadline;
+        static ClockFunc clock_func;
 };  // end class MgenDispatchBudget
 
 #endif // _MGEN_GLOBALS
