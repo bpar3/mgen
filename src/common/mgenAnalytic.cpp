@@ -14,12 +14,19 @@ MgenAnalytic::MgenAnalytic()
  : flow_key(NULL), flow_keysize(0), window_size(DEFAULT_WINDOW), window_valid(false),
    msg_count(0), byte_count(0), dup_msg_count(0), latency_sum(0.0),
    tcp_stream_socket(NULL), tcp_stream_enabled(false), tcp_stream_is_tx(false),
-   tcp_stream_attributable(true), tcp_queue_initialized(false),
+   tcp_stream_attributable(true), tcp_stream_disabled_reason(TCP_STREAM_OK),
+   tcp_queue_initialized(false),
    tcp_window_sample_valid(false), tcp_io_total(0), tcp_io_prev(0),
    tcp_queue_prev(0),
+   tcp_stream_socket_ever_set(false), tcp_stream_pending_generation(false),
+   tcp_stream_generation(0), tcp_stream_next_sample_id(1),
+   tcp_stream_total_bytes(0), tcp_stream_total_initialized(false),
+   tcp_stream_reason(TCP_STREAM_UNSUPPORTED), tcp_stream_sample_id(0),
    report_valid(false), report_msg_count(0),
    report_tcp_stream_valid(false), report_tcp_stream_rate_ave(0.0),
-   report_tcp_stream_bytes(0)
+   report_tcp_stream_bytes(0), report_tcp_stream_reason(TCP_STREAM_UNSUPPORTED),
+   report_tcp_stream_total_bytes(0), report_tcp_stream_sample_id(0),
+   report_tcp_stream_generation(0)
 {
     // Adjust set window_size to quantized version
     UINT8 q = Report::QuantizeTimeValue(window_size);
@@ -92,6 +99,25 @@ bool MgenAnalytic::Init(Protocol               protocol,
     return true;
 }  // end MgenAnalytic::Init()
 
+const char* MgenAnalytic::GetTcpStreamReasonString(TcpStreamReason reason)
+{
+    switch (reason)
+    {
+        case TCP_STREAM_OK:                  return "ok";
+        case TCP_STREAM_INITIAL_BASELINE:    return "initial_baseline";
+        case TCP_STREAM_LATE_BOUNDARY:       return "late_boundary";
+        case TCP_STREAM_MISSED_BOUNDARIES:   return "missed_boundaries";
+        case TCP_STREAM_IOCTL_FAILED:        return "ioctl_failed";
+        case TCP_STREAM_DISCONNECTED:        return "disconnected";
+        case TCP_STREAM_SOCKET_CHANGED:      return "socket_changed";
+        case TCP_STREAM_SHARED_SOCKET:       return "shared_socket";
+        case TCP_STREAM_CHECKSUM_AMBIGUOUS:  return "checksum_ambiguous";
+        case TCP_STREAM_COUNTER_INCONSISTENT:return "counter_inconsistent";
+        case TCP_STREAM_UNSUPPORTED:
+        default:                             return "unsupported";
+    }
+}  // end MgenAnalytic::GetTcpStreamReasonString()
+
 void MgenAnalytic::SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
                                 bool includeQueuedBytes)
 {
@@ -99,10 +125,31 @@ void MgenAnalytic::SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
     bool enabledChanged = tcp_stream_enabled != enabled;
     if (socketChanged || enabledChanged)
     {
+        // A generation boundary is a real socket replacement: either this
+        // is the first time a socket has ever been attached (no prior
+        // generation to distinguish from), or a previous socket was
+        // explicitly detached (ClearTcpStreamSocket()) before this one
+        // attached.  No queue arithmetic may cross that boundary.
+        if (socketChanged && NULL != theSocket &&
+            tcp_stream_socket_ever_set && tcp_stream_pending_generation)
+        {
+            tcp_stream_generation++;
+            tcp_stream_total_bytes = 0;
+            tcp_stream_total_initialized = false;
+            tcp_stream_reason = TCP_STREAM_SOCKET_CHANGED;
+        }
+        if (NULL != theSocket)
+        {
+            tcp_stream_socket_ever_set = true;
+            tcp_stream_pending_generation = false;
+        }
         tcp_stream_socket = theSocket;
         tcp_stream_is_tx = isTx;
         if (socketChanged)
+        {
             tcp_stream_attributable = true;
+            tcp_stream_disabled_reason = TCP_STREAM_OK;
+        }
         tcp_queue_initialized = false;
         tcp_window_sample_valid = false;
         tcp_io_total = 0;
@@ -139,13 +186,20 @@ void MgenAnalytic::SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
 
 void MgenAnalytic::ClearTcpStreamSocket()
 {
+    // Detach without resetting lifetime reporting state (cumulative total,
+    // generation, sample id): a later reattach on a genuinely new socket
+    // will bump the generation via SetTcpStream(); this only clears the
+    // low-level queue/io baseline that is meaningless without a socket.
     tcp_stream_socket = NULL;
     tcp_stream_attributable = true;
+    tcp_stream_disabled_reason = TCP_STREAM_OK;
     tcp_queue_initialized = false;
     tcp_window_sample_valid = false;
     tcp_io_total = 0;
     tcp_io_prev = 0;
     tcp_queue_prev = 0;
+    if (tcp_stream_socket_ever_set)
+        tcp_stream_pending_generation = true;
 }
 
 void MgenAnalytic::AddTcpStreamIoBytes(unsigned long long byteCount,
@@ -282,24 +336,60 @@ void MgenAnalytic::TxLog(FILE*            filePtr,
             Mgen::Log(filePtr," tcpStreamRate>%lf kbps tcpStreamBytes>%llu",
                       report_tcp_stream_rate_ave*8.0e-03,
                       report_tcp_stream_bytes);
+        Mgen::Log(filePtr," tcpStreamReason>%s tcpStreamTotalBytes>%llu"
+                          " tcpStreamSampleTime>%lu.%06lu tcpStreamSampleId>%u"
+                          " tcpStreamGeneration>%u",
+                  GetTcpStreamReasonString(report_tcp_stream_reason),
+                  report_tcp_stream_total_bytes,
+                  report_tcp_stream_sample_time.sec(),
+                  report_tcp_stream_sample_time.usec(),
+                  report_tcp_stream_sample_id,
+                  report_tcp_stream_generation);
     }
     Mgen::Log(filePtr,"\n");
 }  // end MgenAnalytic::TxLog()
 
-void MgenAnalytic::FinalizeTcpStream(bool sampleTcpStream)
+void MgenAnalytic::FinalizeTcpStream(bool sampleTcpStream, const ProtoTime& sampleTime)
 {
     report_tcp_stream_valid = false;
     report_tcp_stream_rate_ave = 0.0;
     report_tcp_stream_bytes = 0;
-    if (!tcp_stream_enabled || !tcp_stream_attributable || NULL == tcp_stream_socket)
+    // Cumulative metadata defaults to whatever the last successful
+    // observation resolved; only overwritten below on a new observation.
+    report_tcp_stream_reason = tcp_stream_reason;
+    report_tcp_stream_total_bytes = tcp_stream_total_bytes;
+    report_tcp_stream_sample_time = tcp_stream_sample_time;
+    report_tcp_stream_sample_id = tcp_stream_sample_id;
+    report_tcp_stream_generation = tcp_stream_generation;
+
+    if (!tcp_stream_enabled)
         return;
+
+    if (!tcp_stream_attributable)
+    {
+        tcp_stream_reason = tcp_stream_disabled_reason;
+        report_tcp_stream_reason = tcp_stream_reason;
+        return;
+    }
+
+    if (NULL == tcp_stream_socket)
+    {
+        tcp_stream_reason = TCP_STREAM_DISCONNECTED;
+        report_tcp_stream_reason = tcp_stream_reason;
+        return;
+    }
 
 #if defined(LINUX) && defined(SIOCOUTQNSD) && defined(SIOCINQ)
     if (!tcp_stream_socket->IsConnected())
     {
+        // The socket is already gone; nothing further can be observed for
+        // this generation.  A later reattach starts a fresh generation via
+        // SetTcpStream(), so there is no gap left to preserve here.
         tcp_queue_initialized = false;
         tcp_window_sample_valid = false;
         tcp_io_prev = tcp_io_total;
+        tcp_stream_reason = TCP_STREAM_DISCONNECTED;
+        report_tcp_stream_reason = tcp_stream_reason;
         return;
     }
 
@@ -307,9 +397,12 @@ void MgenAnalytic::FinalizeTcpStream(bool sampleTcpStream)
     const int query = tcp_stream_is_tx ? SIOCOUTQNSD : SIOCINQ;
     if (0 != ioctl(tcp_stream_socket->GetHandle(), query, &queueValue))
     {
-        tcp_queue_initialized = false;
-        tcp_window_sample_valid = false;
-        tcp_io_prev = tcp_io_total;
+        // Leave the prior successful snapshot (tcp_io_prev/tcp_queue_prev)
+        // unchanged so successful application I/O keeps accumulating in
+        // tcp_io_total; a later successful observation then resolves one
+        // larger aggregate delta instead of silently losing this interval.
+        tcp_stream_reason = TCP_STREAM_IOCTL_FAILED;
+        report_tcp_stream_reason = tcp_stream_reason;
         return;
     }
 
@@ -321,6 +414,8 @@ void MgenAnalytic::FinalizeTcpStream(bool sampleTcpStream)
         tcp_io_prev = tcp_io_total;
         tcp_queue_initialized = true;
         tcp_window_sample_valid = false;
+        tcp_stream_reason = TCP_STREAM_INITIAL_BASELINE;
+        report_tcp_stream_reason = tcp_stream_reason;
         return;
     }
 
@@ -329,25 +424,81 @@ void MgenAnalytic::FinalizeTcpStream(bool sampleTcpStream)
     tcp_io_prev = tcp_io_total;
     tcp_queue_prev = queueNow;
 
-    if (!sampleTcpStream || !tcp_window_sample_valid)
+    // Compute the raw (unclamped) stream-byte delta so an impossible
+    // pairing (TX queue growth exceeding writes, or RX queue shrinkage
+    // exceeding reads) can be reported as counter_inconsistent instead of
+    // silently clamped to a valid-looking zero.
+    long long rawStreamBytes = tcp_stream_is_tx ?
+        ((long long)ioDelta - queueDelta) : ((long long)ioDelta + queueDelta);
+    if (rawStreamBytes < 0)
     {
-        tcp_window_sample_valid = true;
-        return;  // Rebaseline without inventing a complete-window sample.
+        tcp_window_sample_valid = true;  // rebaseline at this coherent sample
+        tcp_stream_reason = TCP_STREAM_COUNTER_INCONSISTENT;
+        report_tcp_stream_reason = tcp_stream_reason;
+        return;  // do not advance tcp_stream_total_bytes for this interval
+    }
+    unsigned long long streamBytes = (unsigned long long)rawStreamBytes;
+
+    bool firstResolvedSample = !tcp_window_sample_valid;
+    tcp_window_sample_valid = true;
+
+    // Every coherent delta is added to the lossless cumulative total, even
+    // when it cannot be attributed to this single nominal report window.
+    tcp_stream_total_bytes = tcp_stream_total_initialized ?
+        (tcp_stream_total_bytes + streamBytes) : streamBytes;
+    tcp_stream_total_initialized = true;
+    tcp_stream_sample_id = tcp_stream_next_sample_id++;
+    tcp_stream_sample_time = sampleTime;
+
+    if (firstResolvedSample)
+    {
+        // The immediately preceding call only established a baseline (or
+        // rebaselined after a counter_inconsistent/ioctl_failed gap), so
+        // this delta has no attributable single-window endpoint yet.
+        tcp_stream_reason = TCP_STREAM_INITIAL_BASELINE;
+    }
+    else if (!sampleTcpStream)
+    {
+        // The caller (Mgen::FlushTxAnalytic/FlushRxAnalytic) determined
+        // this flush is catching up more than one full window late.
+        tcp_stream_reason = TCP_STREAM_MISSED_BOUNDARIES;
+    }
+    else
+    {
+        double tolerance = window_size * 0.01;
+        if (tolerance < 0.001) tolerance = 0.001;
+        if (tolerance > 0.010) tolerance = 0.010;
+        double lateness = sampleTime.GetValue() - window_end.GetValue();
+        if (lateness < 0.0) lateness = 0.0;
+        tcp_stream_reason = (lateness <= tolerance) ?
+            TCP_STREAM_OK : TCP_STREAM_LATE_BOUNDARY;
     }
 
-    report_tcp_stream_bytes = tcp_stream_is_tx ?
-        ComputeTxStreamBytes(ioDelta, queueDelta) :
-        ComputeRxStreamBytes(ioDelta, queueDelta);
-    report_tcp_stream_rate_ave = (report_duration > 0.0) ?
-        ((double)report_tcp_stream_bytes / report_duration) : 0.0;
-    report_tcp_stream_valid = true;
-    tcp_window_sample_valid = true;
+    report_tcp_stream_reason = tcp_stream_reason;
+    report_tcp_stream_total_bytes = tcp_stream_total_bytes;
+    report_tcp_stream_sample_time = tcp_stream_sample_time;
+    report_tcp_stream_sample_id = tcp_stream_sample_id;
+    report_tcp_stream_generation = tcp_stream_generation;
+
+    if (TCP_STREAM_OK == tcp_stream_reason)
+    {
+        // Only a clean, on-time, single-window match is a direct
+        // measurement; late/missed/rebaselined intervals still advance the
+        // cumulative total above but leave RTM to interpolate.
+        report_tcp_stream_bytes = streamBytes;
+        report_tcp_stream_rate_ave = (report_duration > 0.0) ?
+            ((double)streamBytes / report_duration) : 0.0;
+        report_tcp_stream_valid = true;
+    }
 #else
     (void)sampleTcpStream;
+    (void)sampleTime;
+    tcp_stream_reason = TCP_STREAM_UNSUPPORTED;
+    report_tcp_stream_reason = tcp_stream_reason;
 #endif
 }
 
-void MgenAnalytic::FinalizeTxWindow(bool sampleTcpStream)
+void MgenAnalytic::FinalizeTxWindow(bool sampleTcpStream, const ProtoTime& sampleTime)
 {
     if (!window_valid)
         return;
@@ -364,7 +515,7 @@ void MgenAnalytic::FinalizeTxWindow(bool sampleTcpStream)
     report_rate_ave = (report_duration > 0.0) ?
                       ((double)byte_count / report_duration) : 0.0;
 
-    FinalizeTcpStream(sampleTcpStream);
+    FinalizeTcpStream(sampleTcpStream, sampleTime.IsZero() ? window_end : sampleTime);
 
     // Keep the encoded report message on the legacy complete-message metric.
     report_msg.SetWindowSize(report_duration);
@@ -478,7 +629,7 @@ bool MgenAnalytic::Update(const ProtoTime& rxTime,
     return false; 
 }  // end MgenAnalytic::Update()
 
-void MgenAnalytic::FinalizeRxWindow(bool sampleTcpStream)
+void MgenAnalytic::FinalizeRxWindow(bool sampleTcpStream, const ProtoTime& sampleTime)
 {
     if (!window_valid)
         return;
@@ -487,7 +638,7 @@ void MgenAnalytic::FinalizeRxWindow(bool sampleTcpStream)
     report_valid = true;
     report_start = window_start;
     report_duration = window_size;
-    FinalizeTcpStream(sampleTcpStream);
+    FinalizeTcpStream(sampleTcpStream, sampleTime.IsZero() ? window_end : sampleTime);
 
     UINT32 seqMax;
     if (!dup_mask.GetLastSet(seqMax))  // gets highest sequence number observed
@@ -601,6 +752,15 @@ void MgenAnalytic::Log(FILE*            filePtr,
             Mgen::Log(filePtr," tcpStreamRate>%lf kbps tcpStreamBytes>%llu",
                       report_tcp_stream_rate_ave*8.0e-03,
                       report_tcp_stream_bytes);
+        Mgen::Log(filePtr," tcpStreamReason>%s tcpStreamTotalBytes>%llu"
+                          " tcpStreamSampleTime>%lu.%06lu tcpStreamSampleId>%u"
+                          " tcpStreamGeneration>%u",
+                  GetTcpStreamReasonString(report_tcp_stream_reason),
+                  report_tcp_stream_total_bytes,
+                  report_tcp_stream_sample_time.sec(),
+                  report_tcp_stream_sample_time.usec(),
+                  report_tcp_stream_sample_id,
+                  report_tcp_stream_generation);
     }
     Mgen::Log(filePtr,"\n");
 }  // end void MgenAnalytic:::Log()

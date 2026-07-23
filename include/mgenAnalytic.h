@@ -133,8 +133,14 @@ class MgenAnalytic : public ProtoQueue::Item
         // Finalize the current window into the "report_*" results (and the
         // report_msg buffer), then reset counts and advance the window by
         // one window_size.  Called once per elapsed window by the timer.
-        void FinalizeTxWindow(bool sampleTcpStream = true);
-        void FinalizeRxWindow(bool sampleTcpStream = true);
+        // "sampleTime" is the actual wall-clock time of this flush (not the
+        // nominal window boundary); a zero/default ProtoTime means "assume
+        // on-time" and falls back to the window's own end time, which is
+        // what the analytic unit tests exercise.
+        void FinalizeTxWindow(bool sampleTcpStream = true,
+                              const ProtoTime& sampleTime = ProtoTime());
+        void FinalizeRxWindow(bool sampleTcpStream = true,
+                              const ProtoTime& sampleTime = ProtoTime());
 
         // True when the current window has fully elapsed as of "now"
         bool WindowElapsed(const ProtoTime& now) const
@@ -142,14 +148,37 @@ class MgenAnalytic : public ProtoQueue::Item
         bool HasWindow() const
             {return window_valid;}
 
+        // Stable diagnostic reason for a TCP stream sample's valid/invalid
+        // nominal-window state.  Independent of whether the cumulative
+        // total could still be advanced for the same window (see
+        // GetReportTcpStreamReason() vs GetReportTcpStreamValid()).
+        enum TcpStreamReason
+        {
+            TCP_STREAM_OK = 0,
+            TCP_STREAM_INITIAL_BASELINE,
+            TCP_STREAM_LATE_BOUNDARY,
+            TCP_STREAM_MISSED_BOUNDARIES,
+            TCP_STREAM_IOCTL_FAILED,
+            TCP_STREAM_DISCONNECTED,
+            TCP_STREAM_SOCKET_CHANGED,
+            TCP_STREAM_SHARED_SOCKET,
+            TCP_STREAM_CHECKSUM_AMBIGUOUS,
+            TCP_STREAM_COUNTER_INCONSISTENT,
+            TCP_STREAM_UNSUPPORTED
+        };
+        static const char* GetTcpStreamReasonString(TcpStreamReason reason);
+
         // TCP stream accounting is separate from complete-message analytics.
         // TX counts successful socket writes and samples SIOCOUTQNSD; RX counts
         // successful reads and samples SIOCINQ.
         void SetTcpStream(ProtoSocket* theSocket, bool isTx, bool enabled,
                           bool includeQueuedBytes = false);
         void ClearTcpStreamSocket();
-        void DisableTcpStreamAttribution()
-            {tcp_stream_attributable = false;}
+        void DisableTcpStreamAttribution(TcpStreamReason reason = TCP_STREAM_SHARED_SOCKET)
+        {
+            tcp_stream_attributable = false;
+            tcp_stream_disabled_reason = reason;
+        }
         ProtoSocket* GetTcpStreamSocket() const
             {return tcp_stream_socket;}
         void AddTcpStreamIoBytes(unsigned long long byteCount,
@@ -197,7 +226,17 @@ class MgenAnalytic : public ProtoQueue::Item
             {return report_tcp_stream_rate_ave;}
         unsigned long long GetReportTcpStreamBytes() const
             {return report_tcp_stream_bytes;}
-        
+        TcpStreamReason GetReportTcpStreamReason() const
+            {return report_tcp_stream_reason;}
+        unsigned long long GetReportTcpStreamTotalBytes() const
+            {return report_tcp_stream_total_bytes;}
+        const ProtoTime& GetReportTcpStreamSampleTime() const
+            {return report_tcp_stream_sample_time;}
+        UINT32 GetReportTcpStreamSampleId() const
+            {return report_tcp_stream_sample_id;}
+        UINT32 GetReportTcpStreamGeneration() const
+            {return report_tcp_stream_generation;}
+
         // Worst-case flow key length (in bytes):
         // IPv6 dstAddr + dstPort + IPv6 srcAddr + srcPort + flowId
         //      16      +    2    +      16      +    2    +    4
@@ -424,7 +463,7 @@ class MgenAnalytic : public ProtoQueue::Item
             {return flow_keysize;}  
         
     private:
-        void FinalizeTcpStream(bool sampleTcpStream);
+        void FinalizeTcpStream(bool sampleTcpStream, const ProtoTime& sampleTime);
 
         char*               flow_key;
         unsigned int        flow_keysize;  // in bits
@@ -449,11 +488,30 @@ class MgenAnalytic : public ProtoQueue::Item
         bool                tcp_stream_enabled;
         bool                tcp_stream_is_tx;
         bool                tcp_stream_attributable;
+        TcpStreamReason     tcp_stream_disabled_reason;  // why attribution was disabled
         bool                tcp_queue_initialized;
         bool                tcp_window_sample_valid;
         unsigned long long  tcp_io_total;
         unsigned long long  tcp_io_prev;
         unsigned long long  tcp_queue_prev;
+
+        // Lossless cumulative sample state (Phase 2).  This tracks every
+        // coherent queue-sample delta for the current socket generation,
+        // independent of whether a given delta could be attributed to a
+        // single nominal report window.
+        bool                tcp_stream_socket_ever_set;      // false until first SetTcpStream() w/ a real socket
+        bool                tcp_stream_pending_generation;    // set by ClearTcpStreamSocket(); consumed by next attach
+        UINT32              tcp_stream_generation;            // increments when the socket is replaced/reconnected
+        UINT32              tcp_stream_next_sample_id;         // next id to assign on a successful observation
+        unsigned long long  tcp_stream_total_bytes;           // monotonic resolved-byte sum for this generation
+        bool                tcp_stream_total_initialized;
+
+        // Fields describing the most recent successful queue observation
+        // (the "current attribution reason"/cumulative metadata that gets
+        // copied into the report_* fields at FinalizeTcpStream() time).
+        TcpStreamReason     tcp_stream_reason;
+        UINT32              tcp_stream_sample_id;
+        ProtoTime           tcp_stream_sample_time;
 
         // Results of previous analytic
         bool                report_valid;
@@ -468,6 +526,11 @@ class MgenAnalytic : public ProtoQueue::Item
         bool                report_tcp_stream_valid;
         double              report_tcp_stream_rate_ave;
         unsigned long long  report_tcp_stream_bytes;
+        TcpStreamReason     report_tcp_stream_reason;
+        unsigned long long  report_tcp_stream_total_bytes;
+        ProtoTime           report_tcp_stream_sample_time;
+        UINT32              report_tcp_stream_sample_id;
+        UINT32              report_tcp_stream_generation;
         ProtoTime           report_time;
         UINT32              report_buffer[Report::MAX_LENGTH/sizeof(UINT32)];
         Report              report_msg;

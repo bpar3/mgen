@@ -1127,7 +1127,7 @@ void Mgen::UpdateRecvAnalytics(const ProtoTime& theTime,
     analytic->SetTcpStream(rxSocket, false,
                            tcp_stream_analytics && TCP == theProtocol);
     if (checksum_force || theMsg->FlagIsSet(MgenMsg::CHECKSUM))
-        analytic->DisableTcpStreamAttribution();
+        analytic->DisableTcpStreamAttribution(MgenAnalytic::TCP_STREAM_CHECKSUM_AMBIGUOUS);
     if (tcp_stream_analytics && NULL != rxSocket)
         DisableSharedTcpStream(analytic_table, *analytic, rxSocket);
     FlushRxAnalytic(*analytic, theTime);
@@ -1166,7 +1166,7 @@ void Mgen::UpdateRecvStreamAnalytics(const ProtoTime& theTime,
 
     analytic->SetTcpStream(rxSocket, false, true, created);
     if (checksum_force || theMsg->FlagIsSet(MgenMsg::CHECKSUM))
-        analytic->DisableTcpStreamAttribution();
+        analytic->DisableTcpStreamAttribution(MgenAnalytic::TCP_STREAM_CHECKSUM_AMBIGUOUS);
     DisableSharedTcpStream(analytic_table, *analytic, rxSocket);
     FlushRxAnalytic(*analytic, theTime);
     analytic->AddTcpStreamIoBytes(byteCount, theTime);
@@ -1220,7 +1220,7 @@ void Mgen::FlushTxAnalytic(MgenAnalytic& analytic, const ProtoTime& now)
     while (analytic.WindowElapsed(now))
     {
         ProtoTime windowEnd = analytic.GetWindowEnd();
-        analytic.FinalizeTxWindow(!missedBoundary);
+        analytic.FinalizeTxWindow(!missedBoundary, now);
         analytic.TxLog(log_file, windowEnd, local_time);
     }
 }  // end Mgen::FlushTxAnalytic()
@@ -1232,7 +1232,7 @@ void Mgen::FlushRxAnalytic(MgenAnalytic& analytic, const ProtoTime& now)
     while (analytic.WindowElapsed(now))
     {
         ProtoTime windowEnd = analytic.GetWindowEnd();
-        analytic.FinalizeRxWindow(!missedBoundary);
+        analytic.FinalizeRxWindow(!missedBoundary, now);
         MgenFlow* nextFlow = flow_list.Head();
         while (NULL != nextFlow)
         {
@@ -1272,7 +1272,7 @@ void Mgen::DisableRecvTcpStreamAttribution(ProtoSocket* socket)
     while (NULL != (analytic = iterator.GetNextItem()))
     {
         if (analytic->GetTcpStreamSocket() == socket)
-            analytic->DisableTcpStreamAttribution();
+            analytic->DisableTcpStreamAttribution(MgenAnalytic::TCP_STREAM_CHECKSUM_AMBIGUOUS);
     }
 }  // end Mgen::DisableRecvTcpStreamAttribution()
 
@@ -1286,8 +1286,8 @@ void Mgen::DisableSharedTcpStream(MgenAnalyticTable& table,
     {
         if (other != &analytic && other->GetTcpStreamSocket() == socket)
         {
-            other->DisableTcpStreamAttribution();
-            analytic.DisableTcpStreamAttribution();
+            other->DisableTcpStreamAttribution(MgenAnalytic::TCP_STREAM_SHARED_SOCKET);
+            analytic.DisableTcpStreamAttribution(MgenAnalytic::TCP_STREAM_SHARED_SOCKET);
         }
     }
 }  // end Mgen::DisableSharedTcpStream()
